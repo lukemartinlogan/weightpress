@@ -51,7 +51,7 @@ def main() -> int:
     A = L.append
 
     A("Hardware: RTX 5080 (16 GiB), torch 2.11 + CUDA 12.8. Defaults throughout")
-    A("(`eb=1e-4`, 128 MiB windows, `tuple_size=2`, k search by size) unless noted.")
+    A("(`eb=1e-4` relative, 128 MiB windows, `tuple_size=2`, k search by size) unless noted.")
     A("Every row was verified by decoding the container and comparing against the")
     A("source value by value.")
     A("")
@@ -70,8 +70,9 @@ def main() -> int:
           f"{r['ratio_vs_fp32']:.2f}x | {r['ratio_vs_source']:.2f}x | "
           f"{r['max_error']:.3e} | {r['violations']} |")
     A("")
-    A("`vs source` is the number that matters for a bf16 checkpoint: the fp32 column")
-    A("credits the codec for undoing a widening it performed itself.")
+    A("`vs source` is the number that matters for a bf16 checkpoint. TinyLlama sits")
+    A("near 1x because a relative 1e-4 bound asks for 0.01% precision while bf16")
+    A("only carries ~0.4% -- reproducing it that finely needs nearly its 16 bits.")
     A("")
 
     if lossless:
@@ -101,13 +102,13 @@ def main() -> int:
               f"{r['label_bytes']/MB:.1f} MiB | {r['code_bytes']/MB:.1f} MiB | "
               f"{r['bits_per_value']:.2f} | **{r['ratio_vs_source']:.2f}x** |")
         A("")
-        A("**The codebook is a net loss.** At k=64 the labels cost 2.66 bits/value")
-        A("and buy back only 2.09 bits of residual entropy. Adjacent weights in a")
-        A("flattened transformer tensor are close to uncorrelated, so a 2-D")
-        A("codebook has almost no structure to exploit -- and the label has to be")
-        A("paid for regardless. This is not an artefact of the fit: an explicit")
-        A("label can only beat scalar quantization by the space-filling advantage")
-        A("of the lattice, which in 2-D is bounded by about 0.17 bits per tuple.")
+        A("**The codebook is a net loss.** Every extra label costs more than the")
+        A("sharper prediction saves: adjacent log-magnitudes in a flattened")
+        A("transformer tensor are close to uncorrelated, so a 2-D codebook has")
+        A("almost no structure to exploit, and the label is paid for regardless.")
+        A("This is not an artefact of the fit: an explicit label can only beat")
+        A("scalar quantization by the lattice space-filling gain, ~0.17 bits per")
+        A("2-D tuple.")
         A("")
         srch = sweeps.get("baseline-k-search")
         if srch:
@@ -191,8 +192,8 @@ def main() -> int:
         first, last = vq["trials"][0], vq["trials"][-1]
         shrink = first["vq_mean_abs_error"] / max(1e-12, last["vq_mean_abs_error"])
         A(f"Over a {last['k']//first['k']}x increase in k the *mean* error falls")
-        A(f"{shrink:.0f}x, while the *max* error goes from {first['vq_max_error']:.1f}")
-        A(f"to {last['vq_max_error']:.1f} -- it does not converge toward 1e-4 at all.")
+        A(f"{shrink:.0f}x, while the *max* error stays around {last['vq_max_error']:.1f}")
+        A("-- it does not converge toward the bound at all.")
         A("Lloyd's minimises squared error, so extra centroids chase the bulk of the")
         A("distribution; the max is set by a handful of tail weights that keep")
         A("sharing a cluster with everything else. Even if it did converge, matching")
