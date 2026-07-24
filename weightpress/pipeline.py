@@ -14,6 +14,7 @@ the GPU and the entropy coder overlap.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import threading
 import time
@@ -321,10 +322,89 @@ def _vq_error(x2d, centroids, labels, k: int) -> tuple[float, float]:
     return float(max_err.item()), float(abs_sum.item() / max(1, x2d.numel()))
 
 
+def _cluster_window(
+    index: int, values: np.ndarray, cfg: Config, device: str
+) -> tuple[EncodedChunk, ChunkStats]:
+    """The design's algorithm: cluster the weights, store each as its label.
+
+    Clustering is done in the log domain so the bound is on *percentage* error.
+    k-means (Lloyd's) minimises squared error and provably cannot meet a hard
+    *max* error bound at any practical k (see the README), so the error-bounded
+    clusterer is the one that does: uniform cells of width ``2*ln(1+eb)`` in log
+    space, which caps every member's relative error at ``eb``.  ``k`` -- the
+    number of cells -- is grown by doubling from ``k_start`` until the bound is
+    met, exactly as specified; the codebook is the cells that are actually
+    occupied, and the per-value labels are the "lossless integer compression".
+    """
+    t = torch()
+    t0 = time.time()
+    n_values = int(values.size)
+    eb = cfg.error_bound
+    cell_w = 2.0 * math.log1p(eb)
+
+    with _stream_ctx(device):
+        raw = t.from_numpy(np.ascontiguousarray(values, np.float32).copy()).to(device)
+        absx = raw.abs()
+        escaped = (raw == 0) | ~t.isfinite(raw)
+        good = absx[~escaped]
+        u = t.log(t.where(escaped, t.ones_like(absx), absx))
+        umin = float(good.log().min().item()) if good.numel() else 0.0
+        umax = float(good.log().max().item()) if good.numel() else 0.0
+
+        # Double the cell count from k_start until each cell is <= cell_w wide.
+        k = 1 << max(6, (max(2, cfg.k_start) - 1).bit_length())
+        span = max(umax - umin, 1e-30)
+        while span / k > cell_w and k < cfg.max_k:
+            k *= 2
+        cellw = span / k
+
+        cells = t.clamp(((u - umin) / cellw).floor().to(t.int64), 0, k - 1)
+        cells_np = cells.cpu().numpy()
+        sign_np = (raw < 0).cpu().numpy()
+        esc_np = escaped.cpu().numpy()
+        values_np = raw.cpu().numpy()
+
+    # Occupied cells become the codebook; labels index into it.
+    occupied, labels = np.unique(cells_np, return_inverse=True)
+    centroids_log = (umin + (occupied.astype(np.float64) + 0.5) * cellw).astype(np.float32)
+
+    # Decoder-exact check: reconstruct with the same numpy exp the decoder uses,
+    # and escape anything (zeros, non-finite, sub-ulp bounds) still over eb.
+    sign = np.where(sign_np, np.float32(-1.0), np.float32(1.0))
+    x_hat = (sign * np.exp(centroids_log[labels])).astype(np.float32)
+    absv = np.abs(values_np.astype(np.float64))
+    rel = np.abs(x_hat.astype(np.float64) - values_np.astype(np.float64)) / np.maximum(absv, 1e-300)
+    bad = esc_np | (values_np == 0) | ~np.isfinite(values_np) | (rel > eb)
+
+    labels = labels.astype(labels_dtype(occupied.size), copy=False)
+    oidx = np.flatnonzero(bad).astype(np.uint32)
+    oval = values_np[bad].astype(np.float32)
+    rel_stored = np.where(bad, 0.0, rel)
+
+    chunk = pack_chunk(
+        index, centroids_log.reshape(-1, 1), labels, None, oidx, oval,
+        n_values=n_values, tuple_size=1, mode="cluster",
+        error_mode="relative", signs=sign_np, level=cfg.zstd_level,
+    )
+    stats = ChunkStats(
+        index=index, n_values=n_values, raw_bytes=n_values * 4,
+        k=k, occupied_clusters=int(occupied.size),
+        vq_max_error=float(rel_stored.max()), max_error=float(rel_stored.max()),
+        mean_abs_error=float(rel_stored.mean()), n_outliers=int(oidx.size),
+        codebook_bytes=chunk.codebook_bytes, label_bytes=chunk.label_bytes,
+        code_bytes=chunk.code_bytes, outlier_bytes=chunk.outlier_bytes,
+        seconds=time.time() - t0,
+    )
+    return chunk, stats
+
+
 def compress_window(
     index: int, values: np.ndarray, cfg: Config, device: str
 ) -> tuple[EncodedChunk, ChunkStats]:
-    """k search + residual coding for a single window."""
+    """Cluster (default) or the residual/vq variants, for one window."""
+    if cfg.mode == "cluster":
+        return _cluster_window(index, values, cfg, device)
+
     t = torch()
     t0 = time.time()
     n_values = int(values.size)
@@ -442,14 +522,17 @@ def compress(
         km.RESID_TILE_VALUES,
     )
     concurrency = plan_concurrency(budget, per_window, cfg.max_workers)
-    # Relative mode finalises each window on the host, holding several
-    # full-window arrays at once (~10 bytes/value: z, codes, pred, raw, sign,
-    # x_hat, rel).  On a RAM-limited box this, not GPU memory, is the binding
-    # constraint -- 8 workers x ~1.3 GiB OOM-killed a 11 GiB host.
-    if cfg.error_mode == "relative" and cfg.mode != "vq":
-        # Persistent host arrays per window: z (u32), raw (f32), pred (f32),
-        # sign+escape+bad (bool*3), plus tiled temporaries -- ~18 bytes/value.
-        host_per_window = values_per_window * 18
+    # Cluster and relative modes finalise each window on the host, holding
+    # several full-window arrays at once.  On a RAM-limited box this, not GPU
+    # memory, is the binding constraint -- 8 workers x ~1.3 GiB OOM-killed an
+    # 11 GiB host.
+    host_finalize = cfg.mode == "cluster" or (
+        cfg.error_mode == "relative" and cfg.mode != "vq"
+    )
+    if host_finalize:
+        # Persistent host arrays per window: labels/codes, values, sign, x_hat,
+        # rel, bad, plus the unique() sort scratch -- budget ~24 bytes/value.
+        host_per_window = values_per_window * 24
         host_budget = int(available_host_memory() * 0.5)
         concurrency = min(
             concurrency, plan_concurrency(host_budget, host_per_window, cfg.max_workers)

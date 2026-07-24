@@ -393,8 +393,22 @@ def unpack_chunk(chunk: EncodedChunk) -> np.ndarray:
     # like any other value and dropped after reconstruction.
     n_tuples = -(-chunk.n_values // chunk.tuple_size)
     labels = np.frombuffer(dctx.decompress(chunk.labels_blob), dtype=ldt)[:n_tuples]
-    pred = chunk.centroids[labels.astype(np.int64)].reshape(-1)
 
+    if chunk.mode == "cluster":
+        # Each value is stored as its cluster label; the codebook holds the
+        # cluster centroids in log space.  Reconstruct as sign * exp(centroid).
+        cl = chunk.centroids.reshape(-1)[labels.astype(np.int64)]
+        sign = unpack_signs(dctx.decompress(chunk.sign_blob), chunk.n_values)
+        out = (sign * np.exp(cl)).astype(np.float32)
+        if chunk.n_outliers:
+            deltas = np.frombuffer(dctx.decompress(chunk.outlier_idx_blob), dtype=np.uint32)
+            oidx = np.cumsum(deltas.astype(np.int64))
+            out[oidx] = np.frombuffer(
+                dctx.decompress(chunk.outlier_val_blob), dtype=np.float32
+            )
+        return out[: chunk.n_values]
+
+    pred = chunk.centroids[labels.astype(np.int64)].reshape(-1)
     if chunk.mode == "vq":
         return pred.astype(np.float32)[: chunk.n_values]
 

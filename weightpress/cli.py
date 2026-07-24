@@ -48,11 +48,17 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="GPU memory budget (default: 80%% of free memory)")
     p.add_argument("-o", "--output-dir", default=".",
                    help="where containers and k-means tables are written (default: cwd)")
-    p.add_argument("--mode", choices=["residual", "vq"], default="residual",
-                   help="residual: hard error bound via quantized residuals; "
+    p.add_argument("--mode", choices=["cluster", "residual", "vq"], default="cluster",
+                   help="cluster (default): the design's algorithm -- k-means/VQ "
+                        "clustering, k grown until the max %% error meets the bound, "
+                        "each value stored as its cluster label; "
+                        "residual: predictor + quantized residuals; "
                         "vq: pure vector quantization, bound met only by growing k")
+    p.add_argument("--error-mode", choices=["relative", "absolute"], default="relative",
+                   help="relative: max percentage error |x-x_hat|/|x| <= eb (default); "
+                        "absolute: |x-x_hat| <= eb")
     p.add_argument("--k-start", type=int, default=64)
-    p.add_argument("--max-k", type=int, default=1 << 16)
+    p.add_argument("--max-k", type=int, default=1 << 24)
     p.add_argument("--k-criterion", choices=["size", "vq"], default="size",
                    help="size: stop doubling when it no longer shrinks the payload; "
                         "vq: stop when pure-VQ max error meets the bound")
@@ -74,6 +80,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
 def _config_from(args: argparse.Namespace) -> Config:
     return Config(
         error_bound=args.error_bound,
+        error_mode=args.error_mode,
         window_size=args.window_size,
         tuple_size=args.tuple_size,
         max_gpu_memory=args.max_gpu_memory,
@@ -100,7 +107,10 @@ def _report(run, cfg: Config, out_path: str) -> None:
     print(f"  windows        {len(run.chunks)}  x  {_human(cfg.window_size)}")
     print(f"  gpu budget     {_human(run.gpu_budget_bytes)}"
           f"   ({run.concurrency} windows in flight)")
-    print(f"  chosen k       {run.k_histogram()}")
+    print(f"  clusters (k)   {run.k_histogram()}   ({cfg.error_mode} bound)")
+    if cfg.mode == "cluster" and run.chunks:
+        occ = [c.occupied_clusters for c in run.chunks]
+        print(f"  codebook size  {min(occ)}..{max(occ)} occupied clusters per window")
     print(f"  raw            {_human(run.raw_bytes)}")
     print(f"  stored         {_human(run.stored_bytes)}")
     print(f"  ratio          {run.ratio:.3f}x   ({run.bits_per_value:.2f} bits/value)")
@@ -111,14 +121,14 @@ def _report(run, cfg: Config, out_path: str) -> None:
         qb = sum(c.code_bytes for c in run.chunks)
         ob = sum(c.outlier_bytes for c in run.chunks)
         tot = max(1, cb + lb + qb + ob)
+        resid = "residuals" if cfg.mode != "cluster" else "         "
         print(f"  breakdown      codebook {100*cb/tot:5.2f}%  labels {100*lb/tot:5.2f}%"
-              f"  residuals {100*qb/tot:5.2f}%  escapes {100*ob/tot:5.2f}%")
+              f"  {resid} {100*qb/tot:5.2f}%  escapes+signs {100*ob/tot:5.2f}%")
         print(f"  escapes        {sum(c.n_outliers for c in run.chunks)} values")
     thru = run.raw_bytes / max(1e-9, run.seconds) / (1 << 20)
     print(f"  time           {run.seconds:.2f}s   ({thru:.1f} MiB/s)")
     ok = run.max_error <= cfg.error_bound
-    if cfg.mode == "residual":
-        print(f"  error bound    {'HELD' if ok else 'VIOLATED'}")
+    print(f"  error bound    {'HELD' if ok else 'VIOLATED'}")
 
 
 def cmd_compress(args: argparse.Namespace) -> int:

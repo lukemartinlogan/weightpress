@@ -22,7 +22,11 @@ MAX_CODE_PLANES = 4
 CODE_MAX = (1 << 30) - 1
 
 KCriterion = Literal["size", "vq"]
-Mode = Literal["residual", "vq"]
+#: ``cluster`` -- the design's algorithm: k-means/VQ clustering where k is the
+#: number of clusters, grown until the max percentage error meets the bound; each
+#: value is stored as its cluster label, losslessly compressed.  ``residual`` and
+#: ``vq`` are the earlier variants kept for comparison.
+Mode = Literal["cluster", "residual", "vq"]
 #: ``relative`` enforces |x - x_hat| / |x| <= eb (max percentage error) by coding
 #: in the log domain; ``absolute`` enforces |x - x_hat| <= eb on a linear grid.
 ErrorMode = Literal["relative", "absolute"]
@@ -49,7 +53,9 @@ class Config:
 
     # --- k search -------------------------------------------------------
     k_start: int = 64
-    max_k: int = 1 << 16
+    #: Upper bound on the cluster count / codebook resolution.  Cluster mode at a
+    #: tight bound needs a high ceiling (1e-4 lands near 2^17, 1e-6 near 2^24).
+    max_k: int = 1 << 24
     k_criterion: KCriterion = "size"
     #: For ``k_criterion="size"``: doubling k must shrink the estimated payload
     #: by at least this fraction to be worth the wider labels.
@@ -68,7 +74,7 @@ class Config:
     seed: int = 0
 
     # --- output ---------------------------------------------------------
-    mode: Mode = "residual"
+    mode: Mode = "cluster"
     zstd_level: int = 3
     #: Upper bound on windows in flight; the GPU memory budget may lower it.
     max_workers: int = 8

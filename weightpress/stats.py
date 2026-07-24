@@ -13,7 +13,11 @@ class ChunkStats:
     index: int
     n_values: int
     raw_bytes: int
+    #: In cluster mode, the number of clusters (codebook resolution) the search
+    #: settled on -- the design's k.  In residual/vq mode, the k-means k.
     k: int
+    #: Distinct clusters actually used (<= k); the stored codebook size.
+    occupied_clusters: int = 0
     k_trials: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     #: Max |x - centroid| over the window, i.e. the error of pure vector
     #: quantization before residual correction.

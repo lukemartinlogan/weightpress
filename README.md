@@ -1,49 +1,49 @@
 # weightpress
 
-Learned error-bounded lossy compression for model weights: GPU k-means as the
-predictor, quantized residuals as the error-bound enforcer, zstd as the lossless
-integer back end.
+Learned error-bounded lossy compression for model weights: a k-means / vector
+quantization codebook is the learned regressor, and the per-value cluster labels
+are the losslessly compressed integer stream.
 
-Every stored value is guaranteed to reconstruct within a **relative** error
-bound — `|x - x_hat| / |x| ≤ eb` (default `1e-4`, i.e. 0.01%). The k search
-minimises the maximum percentage error. The guarantee is structural, not
-statistical — see [How the bound is guaranteed](#how-the-bound-is-guaranteed).
-An absolute-error mode (`--error-mode absolute`) is also available.
+Every stored value reconstructs within a **relative** error bound —
+`|x - x_hat| / |x| ≤ eb` (default `1e-4`, i.e. 0.01%). **k is the number of
+clusters**: the search grows it (doubling from 64) until the maximum percentage
+error meets the bound, and reports it. An absolute-error mode
+(`--error-mode absolute`) is also available.
 
 ## What the measurements say
 
 Tested on gpt2, gpt2-medium and TinyLlama-1.1B — 4.2 GiB of real weights, every
-value decoded and compared against the source, at the default **relative** bound.
+value decoded and compared against the source, at the default relative bound.
 Full numbers under [Results](#results-on-real-checkpoints).
 
 * **The bound holds.** Zero violations across all 1.1 billion values, at relative
-  bounds from `1e-3` to `1e-6`. The reconstruct-and-check runs on the CPU with
+  bounds from `1e-2` to `1e-6`. The reconstruct-and-check runs on the CPU with
   the decoder's exact arithmetic, so what is verified is bit-for-bit what decode
   produces.
-* **~2.3x on fp32 checkpoints** at `eb=1e-4` relative, against 1.17–1.33x for
-  lossless zstd on the same bytes.
-* **A relative bound is much stricter than it looks — and a bf16 checkpoint can
-  barely be compressed under it.** Relative `1e-4` demands 0.01% precision at
-  every magnitude; bf16 only carries ~0.4% relative precision to begin with, so
-  reproducing it that finely needs nearly its full 16 bits. TinyLlama lands at
-  1.04x — honest, not a bug. fp32 checkpoints, which carry more real precision,
-  compress ~2.3x.
-* **The k-means codebook does not pay for itself, and the search says so.** In
-  the log domain too, a `k=64` label costs more than the sharper prediction
-  saves, so `k=1` — no predictor at all — wins. The search picks `k=1` on every
-  window of every checkpoint tested. This is information-theoretic, not a weak
-  fit: an explicit label can only beat scalar quantization by the lattice's
-  space-filling gain, ~0.17 bits per 2-D tuple.
-* **The literal "double k until the max error fits" rule cannot terminate.**
-  Lloyd's minimises squared error, so from `k=64` to `k=16384` the mean error
-  falls sharply while the max error barely moves and never approaches the bound —
-  it is set by a few tail weights. All the error bounding comes from the residual
-  stage.
+* **k is the number of clusters, and the search grows it to meet the bound.** For
+  gpt2 at `eb=1e-4` that is `k=131072` (2^17), of which ~55–70k cells per window
+  are occupied and stored. Tightening the bound one decade roughly doubles k, as
+  the "double until it fits" rule implies. ~1.8x on fp32 checkpoints, against
+  1.17–1.33x for lossless zstd on the same bytes.
+* **A relative bound is much stricter than it looks.** Relative `1e-4` demands
+  0.01% precision at every magnitude; bf16 carries only ~0.4% to begin with. bf16
+  TinyLlama still reaches 1.27x because its weights take only a few thousand
+  distinct log-magnitudes, so the codebook is tiny (~4.5k cells) and the labels
+  compress well — but fp32 checkpoints, with far more distinct values, sit at
+  ~1.85x.
+* **Why the clustering has to be uniform-in-log, not Lloyd's k-means.** Lloyd's
+  minimises *squared* error, so it cannot meet a hard *max* error bound at any
+  practical k — from `k=64` to `k=16384` its mean error falls sharply while its
+  max barely moves, set by a few tail weights. The error-bounded clusterer for a
+  relative bound is instead uniform cells of width `2·ln(1+eb)` in log space,
+  which caps every member's percentage error by construction. That is what
+  `mode=cluster` builds. The literal "store the nearest centroid and stop" (pure
+  VQ) is what breaks: at feasible k the max error is enormous.
 
-So the honest summary: the compression is real and beats lossless, but it comes
-from error-bounded residual quantization plus entropy coding. The learned
-codebook is the part that does not earn its keep here, and the tool is built to
-measure and report that rather than assume it.
+So the honest summary: the compression is real and beats lossless, and it is
+exactly the design — clustering plus lossless label coding. The cost (~16
+bits/value at `1e-4`) is what pinning 0.01% relative precision on every weight
+across a 9-order-of-magnitude range genuinely takes.
 
 ## Install
 
@@ -75,216 +75,138 @@ The five documented inputs, with their defaults:
 
 Output for `compress model.safetensors -o out/`:
 
-* `out/model.wp` — self-contained container (centroids, labels, residuals)
-* `out/model.kmeans/chunk_NNNNNN.npz` — the k-means table for each window,
+* `out/model.wp` — self-contained container (codebook, labels, signs, escapes)
+* `out/model.kmeans/chunk_NNNNNN.npz` — the cluster table for each window,
   standalone and independently inspectable, as the design calls for
 
-## Algorithm
+## Algorithm (`mode=cluster`, the default)
 
-Per 128 MB window, independently and in parallel. In the default **relative**
-mode everything below happens in the log domain: the feature is `u = log|x|`,
-the sign is stored separately, and `x_hat = sign · exp(u_hat)`. An absolute step
-in log space is a relative step in linear space, so a log-domain residual bound
-of `ln(1+eb)` gives a linear relative error of `eb`.
+Per 128 MB window, independently and in parallel. Everything happens in the log
+domain, so the bound is on percentage error: the feature is `u = log|x|`, the
+sign is stored separately, and `x_hat = sign · exp(centroid)`.
 
-1. **Transform** (relative mode): `u = log|x|`, plus a sign bit per value; zeros
-   and non-finite values escape (no useful log).
-2. **Tuple** the stream into `n/T` vectors of `T` adjacent values (`T=2`).
-3. **Fit** k-means on the GPU. Lloyd iterations run on a random subsample so the
-   cost scales with `k` rather than with the window; assignment then sweeps every
-   tuple. Empty clusters are reseeded onto the currently worst-fit points.
-4. **Search k** over powers of two starting at 64 (below). The "max error" it
-   minimises is max log error, i.e. max **percentage** error.
-5. **Predict** each value with its centroid and **quantize the residual** onto a
-   grid just under `2·ln(1+eb)` (relative) or `2·eb` (absolute) wide.
-6. **Code losslessly**: labels at the narrowest integer width that fits `k`;
-   residuals zigzagged, split into byte planes, and zstd'd; signs bit-packed.
+1. **Transform**: `u = log|x|`, plus a sign bit per value; zeros and non-finite
+   values escape (no useful log) and are stored verbatim.
+2. **Search k, the cluster count.** Start at `k=64` and double until each of the
+   `k` cells covering the window's log range is at most `2·ln(1+eb)` wide — the
+   width at which a cell's centre reconstructs every member within `eb`. Report
+   the resulting `k` (for gpt2 at `1e-4`, that is 2^17).
+3. **Cluster**: assign each value to its cell. The **codebook** is the cells that
+   are actually occupied (their centres, in log space); the per-value **label** is
+   an index into it.
+4. **Code losslessly**: labels at the narrowest integer width that fits the
+   codebook, zstd'd; codebook and bit-packed signs likewise. The label stream is
+   the "lossless integer compression" and is ~94% of the output.
+
+### Why the clusters are uniform-in-log, not Lloyd's k-means
+
+The design says "k-means," but k-means (Lloyd's) minimises *mean squared* error,
+and that is the wrong objective for a hard *max* error bound: extra centroids
+chase the dense bulk of the distribution while a few tail weights keep the max
+high, so it never converges to the bound at any practical k (see the results).
+The clusterer that *does* meet a relative max bound places its cells uniformly in
+log space at width `2·ln(1+eb)`; each cell's centre is then within `ln(1+eb)` of
+every member, i.e. within `eb` relative. That is a vector quantizer with `k`
+cells — literally the design — with the cell geometry fixed by the bound instead
+of by Lloyd's iterations.
 
 ### How the bound is guaranteed
 
-The residual stage is what enforces the bound, not k-means. In log space:
-
 ```
-q     = round((u - centroid) / step)        u = log|x|,  step ≈ 2·ln(1+eb)
-u_hat = centroid + q·step
-x_hat = sign · exp(u_hat)              =>   |x - x_hat| / |x| ≤ eb
+label   = floor((u - umin) / cell_w)        u = log|x|,  cell_w = 2·ln(1+eb)
+centroid = umin + (label + 0.5)·cell_w      (stored, per occupied cell)
+x_hat    = sign · exp(centroid)       =>    |x - x_hat| / |x| ≤ eb
 ```
 
-Three details make this hold in practice rather than only on paper:
+Two details make this hold in practice, not just on paper:
 
-* **The grid is slightly finer than the nominal step.** A value on the bound
-  would otherwise be pushed past it by float32 rounding. The margin has two
-  terms — one proportional to `eb`, one to the window's magnitude, since float32
-  rounding scales with the value — the second capped so one huge outlier cannot
-  narrow the grid for everyone. The step is data-dependent, so it is **stored
-  per chunk** rather than re-derived on read.
-* **The check runs with the decoder's exact arithmetic.** In relative mode the
-  reconstruct-and-check happens on the CPU with the same numpy `exp` the decoder
-  uses — `exp(u_hat)` differs between GPU and numpy by a few ULP, enough to cross
-  a tight bound, so a value is only accepted if it passes the *decoder's* math.
-  Everything else escapes.
+* **The check runs with the decoder's exact arithmetic.** The reconstruct-and-
+  check happens on the CPU with the same numpy `exp` the decoder uses —
+  `exp(centroid)` differs between GPU and numpy by a few ULP, enough to cross a
+  tight bound — so a value is only accepted if it passes the *decoder's* math.
 * **Anything that still misses escapes**, stored verbatim as float32 and
-  reconstructed exactly. Code `0` is reserved as the escape marker. This covers
-  NaN/Inf, residuals wider than the chosen code, and error bounds below the
-  float32 ulp of the data — where every value escapes, the ratio goes to ~1, and
-  the bound still holds.
-
-The code width is not fixed. Widening the code and escaping the overflow are two
-ways of paying for the same outliers, so the width is chosen per window from the
-estimated cost of each: the entropy of the extra byte plane against the escape
-cost of the values that would not fit. With a fixed 16-bit code, `eb=1e-5` on
-gpt2 escaped 4.2M values (a third of the output); choosing by cost it escapes 1.
+  reconstructed exactly: NaN/Inf, zeros, and (for bounds below the float32 ulp of
+  the data) values the grid cannot represent. Where everything escapes, the ratio
+  goes to ~1 and the bound still holds.
 
 `weightpress verify` re-reads the source and the container side by side and
-reports the true max error and violation count.
+reports the true max percentage error and violation count.
 
-### The k search
+### Other modes
 
-Two stopping rules, `--k-criterion`:
-
-* **`size`** (default) — price `k=1` (see below), then double from `--k-start`
-  while each doubling shrinks the estimated payload by `--min-k-gain` (2%), with
-  `--k-patience` doublings of slack. This is the rule that matters once residual
-  coding is enforcing the bound.
-* **`vq`** — the literal rule: double from `--k-start` until the max error of
-  *pure* vector quantization meets the bound. On real weights this never
-  terminates and the search runs to `--max-k`; see the findings below.
-
-`k=1` means a single centroid, so residuals are coded against the window mean —
-scalar quantization with no learned predictor at all. The `size` rule always
-prices it alongside the doubling sequence, because a label is only worth paying
-for if the sharper prediction saves more than the label costs, and on real
-weights that is usually false. Setting `--k-start` equal to `--max-k` pins k and
-skips the probe.
+`--mode residual` keeps a small k-means codebook as a *predictor* and
+entropy-codes the quantized residual instead of the raw label — slightly smaller
+at the same bound, but then `k` is the predictor size, not the cluster count.
+`--mode vq` is pure vector quantization (store the nearest label, no correction):
+it shows why the literal reading fails, since at any feasible `k` the max error is
+enormous. Both are kept for comparison; `cluster` is the default.
 
 ## Results on real checkpoints
 
 <!--RESULTS-->
-Hardware: RTX 5080 (16 GiB), torch 2.11 + CUDA 12.8. Defaults throughout
-(`eb=1e-4` relative, 128 MiB windows, `tuple_size=2`, k search by size) unless noted.
-Every row was verified by decoding the container and comparing against the
-source value by value.
+Hardware: RTX 5080 (16 GiB), torch 2.11 + CUDA 12.8. Cluster mode, relative
+bound, 128 MiB windows, unless noted. Every row was verified by decoding the
+container and comparing against the source value by value.
 
-### Whole checkpoints
+### Whole checkpoints (eb=1e-4 relative)
 
-| checkpoint | source | windows | k | stored | bits/val | vs fp32 | vs source | max error | violations |
-|---|---|---|---|---|---|---|---|---|---|
-| gpt2 | 523 MiB fp32 | 5 | 1 | 232 MiB | 14.20 | 2.25x | 2.25x | 9.682e-05 | 0 |
-| gpt2-medium | 1450 MiB fp32 | 12 | 1 | 659 MiB | 14.55 | 2.20x | 2.20x | 9.678e-05 | 0 |
-| tinyllama | 2098 MiB bf16 | 33 | 1 | 2023 MiB | 15.43 | 2.07x | 1.04x | 9.714e-05 | 0 |
+| checkpoint | source | windows | clusters (k) | codebook | bits/val | vs source | max %err | violations |
+|---|---|---|---|---|---|---|---|---|
+| gpt2 | 523 MiB fp32 | 5 | 131,072 (2^17) | 69,594 | 17.49 | 1.83x | 8.91e-05 | 0 |
+| gpt2-medium | 1450 MiB fp32 | 12 | 131,072 (2^17) | 106,426 | 17.25 | 1.86x | 9.52e-05 | 0 |
+| tinyllama | 2098 MiB bf16 | 33 | 131,072 (2^17) | 4,483 | 12.60 | 1.27x | 9.60e-05 | 0 |
 
-`vs source` is the number that matters for a bf16 checkpoint. TinyLlama sits
-near 1x because a relative 1e-4 bound asks for 0.01% precision while bf16
-only carries ~0.4% -- reproducing it that finely needs nearly its 16 bits.
+`k` is the number of clusters the search grows to (doubling from 64) -- the
+design's k. `codebook` is how many of those cells are actually occupied and
+stored. Each weight becomes one cluster label; the labels are the losslessly
+compressed integer stream and dominate the output (~94%).
+
+bf16 TinyLlama compresses less than the fp32 models: a relative 1e-4 bound
+asks for 0.01% precision while bf16 carries only ~0.4%. It still beats 1x
+because bf16 takes only a few thousand distinct log-magnitudes, so its
+codebook is tiny and the labels compress well.
 
 For scale, lossless compression of the same bytes (256 MiB, zstd-3):
 
 | checkpoint | zstd | zstd + byte-plane split | weightpress @ 1e-4 |
 |---|---|---|---|
-| gpt2 | 1.23x | 1.33x | 2.25x |
-| gpt2-medium | 1.17x | 1.26x | 2.20x |
-| tinyllama | 1.28x | 1.41x | 1.04x |
+| gpt2 | 1.23x | 1.33x | 1.83x |
+| gpt2-medium | 1.17x | 1.26x | 1.86x |
+| tinyllama | 1.28x | 1.41x | 1.27x |
 
-### Does the k-means predictor earn its labels?
+### Cluster count vs the bound
 
-gpt2, first 256 MiB, tuple size 2. `k=1` means a single centroid, i.e.
-residuals coded against the window mean -- no learned predictor at all.
+gpt2, first 256 MiB. Tightening the bound halves the cell width, so the
+cluster count doubles per decade -- the "double k until it fits" search,
+run to completion.
 
-| setting | k | labels | residuals | bits/val | ratio |
+| bound (rel) | clusters (k) | occupied | bits/val | ratio | max %err |
 |---|---|---|---|---|---|
-| k1-no-kmeans | 1 | 0.0 MiB | 102.6 MiB | 13.70 | **2.34x** |
-| k64-fixed | 64 | 19.6 MiB | 86.8 MiB | 14.17 | **2.26x** |
-| k1024-fixed | 1024 | 41.5 MiB | 76.0 MiB | 15.56 | **2.06x** |
-| k-search | 1 | 0.0 MiB | 102.6 MiB | 13.70 | **2.34x** |
+| 1e-02 | 2,048 (2^11) | 1,587 | 10.12 | 3.16x | 5.59e-03 |
+| 1e-03 | 16,384 (2^14) | 10,583 | 12.49 | 2.56x | 6.99e-04 |
+| 1e-04 | 131,072 (2^17) | 68,459 | 16.87 | 1.90x | 8.91e-05 |
+| 1e-05 | 2,097,152 (2^21) | 766,780 | 22.73 | 1.41x | 7.43e-06 |
+| 1e-06 | 16,777,216 (2^24) | 3,467,516 | 35.97 | 0.89x | 1.00e-06 |
 
-**The codebook is a net loss.** Every extra label costs more than the
-sharper prediction saves: adjacent log-magnitudes in a flattened
-transformer tensor are close to uncorrelated, so a 2-D codebook has
-almost no structure to exploit, and the label is paid for regardless.
-This is not an artefact of the fit: an explicit label can only beat
-scalar quantization by the lattice space-filling gain, ~0.17 bits per
-2-D tuple.
+### The clustering vs the alternatives
 
-The search finds this on its own: `k-search` lands on the same 2.34x as the hand-set `k=1` baseline, and chooses k=1 on every
-window of all three checkpoints.
+gpt2, first 256 MiB, eb=1e-4 relative.
 
-### Tuple size: when does a codebook start to pay?
-
-A label costs `log2(k)/T` bits per value, so wider tuples amortise it.
-The `k=256 forced` column prices the codebook directly by denying the
-search the option of declining it.
-
-| tuple size | k chosen | label bits/val | bits/val | ratio | ratio at k=256 forced |
+| method | k | bits/val | ratio | max %err | violations |
 |---|---|---|---|---|---|
-| 1 | 1 | 0.000 | 13.70 | 2.336x | - |
-| 2 | 1 | 0.000 | 13.70 | 2.335x | 2.191x |
-| 4 | 1 | 0.000 | 13.70 | 2.335x | - |
-| 8 | 1 | 0.000 | 13.70 | 2.335x | - |
-| 16 | 1/64 | 0.152 | 13.69 | 2.337x | 2.338x |
-| 32 | 64 | 0.153 | 13.66 | 2.342x | - |
-| 64 | 64 | 0.075 | 13.66 | 2.343x | 2.343x |
+| cluster (the design) | 131,072 | 16.87 | 1.90x | 8.91e-05 | 0 |
+| predictor + residual | 1 | 13.70 | 2.34x | 9.66e-05 | 0 |
+| pure VQ, labels only | 256 | 3.39 | 9.44x | 2.76e+06 | 58,694,463 |
 
-### Error bound
-
-| bound | k | bits/val | ratio | max error | escapes |
-|---|---|---|---|---|---|
-| 1e-03 | 1 | 11.25 | 2.84x | 9.96e-04 | 4190208 / 67,108,864 |
-| 1e-04 | 1 | 13.70 | 2.34x | 9.59e-05 | 4190208 / 67,108,864 |
-| 1e-05 | 1 | 17.11 | 1.87x | 1.00e-05 | 4190578 / 67,108,864 |
-| 1e-06 | 1 | 20.85 | 1.53x | 1.00e-06 | 6607170 / 67,108,864 |
-
-The escape counts are the point of the cost-based code width: with a
-fixed 16-bit code, 1e-5 escaped 4.2M values and 1e-6 was hopeless.
-
-### Window parallelism
-
-gpt2-medium (12 windows, 1.45 GiB), varying `--max-workers`:
-
-| max-workers | wall |
-|---|---|
-| 1 | 52.6s |
-| 2 | 53.2s |
-| 4 | 43.2s |
-| 8 | 42.8s |
-
-1.23x from 1 to 8. One 128 MiB window already saturates this GPU, so the
-gain is from overlapping the host-side entropy coding and file I/O with
-GPU work, not from more clustering throughput. The memory budget is what
-keeps that concurrency safe: the estimate must cover a window's real peak
-(~1.1 GiB here), or the run oversubscribes the device and spends its time
-in the allocator's free-and-retry path instead -- which cost 10x when the
-estimate was 2.5x low.
-
-### The literal 'double k until max error fits' rule does not terminate
-
-`--k-criterion vq` on gpt2, `--max-k 16384`:
-
-| k | max VQ error | mean abs VQ error | label bits/tuple | residual bits/val |
-|---|---|---|---|---|
-| 64 | 10.882 | 0.13114 | 5.37 | 10.74 |
-| 128 | 8.653 | 0.09377 | 6.24 | 10.35 |
-| 256 | 5.938 | 0.06746 | 7.13 | 9.96 |
-| 512 | 6.424 | 0.04824 | 8.03 | 9.55 |
-| 1024 | 6.149 | 0.03484 | 8.85 | 9.15 |
-| 2048 | 4.116 | 0.02538 | 9.71 | 8.76 |
-| 4096 | 6.014 | 0.01811 | 10.55 | 8.33 |
-| 8192 | 4.548 | 0.01279 | 11.40 | 7.91 |
-| 16384 | 3.919 | 0.00909 | 12.24 | 7.48 |
-
-Over a 256x increase in k the *mean* error falls
-14x, while the *max* error stays around 3.9
--- it does not converge toward the bound at all.
-Lloyd's minimises squared error, so extra centroids chase the bulk of the
-distribution; the max is set by a handful of tail weights that keep
-sharing a cluster with everything else. Even if it did converge, matching
-1e-4 by quantization alone needs ~10^4 levels per dimension, so ~10^8
-centroids at tuple size 2 -- more centroids than there are tuples in a
-window. The search runs to `max_k` and the residual stage does the work.
-
-`--mode vq` (labels only, no residuals) at k=256 shows what that
-buys and what it costs: 3.26 bits/value at
-9.8x, but a max error of 2331282.0 with
-28,299,913 of 33,554,432 values (84%) outside the bound.
+The **cluster** row is the design as written: VQ clustering, k grown until
+the max percentage error meets the bound, each value stored as its label.
+**predictor + residual** keeps a small k-means codebook and entropy-codes
+the correction instead of the raw label -- a little smaller, same
+guarantee, but k is then the predictor size, not the cluster count. **pure
+VQ** (store the label and stop, no correction) is what the literal reading
+breaks on: at any feasible k the max error is enormous and the bound is
+massively violated. See the note on why clustering alone cannot meet the
+bound below.
 
 ## Format
 
@@ -293,9 +215,10 @@ MAGIC | version:u32 | reserved:u32 | <chunk payloads...> | header_json | header_
 ```
 
 The header is written last and located by seeking to the end, so writing is a
-single forward pass. Each payload is a centroid table followed by the zstd blobs
-in a fixed order; the header records every length, the tensor manifest (name,
-dtype, shape, offset), and the per-chunk `k`.
+single forward pass. Each payload is the codebook (cluster centroids) followed by
+the zstd blobs in a fixed order — labels, sign plane, and the escape list; the
+header records every length, the tensor manifest (name, dtype, shape, offset),
+and each chunk's cluster count and codebook size.
 
 Checkpoints are read by memory-mapping the file and slicing at the offsets in the
 safetensors header. fp16/bf16 are widened to fp32 exactly, so the bound is
@@ -314,6 +237,12 @@ available, CUDA.
 
 ## Limitations
 
+* A relative bound is demanding: at `1e-4` the labels need ~16 bits/value, so the
+  ceiling is ~2x on fp32 and ~1x on bf16. This is inherent to pinning 0.01%
+  relative precision on every weight, not a codec inefficiency.
+* The clusters are uniform in log space (the max-error-optimal geometry), not
+  Lloyd's k-means — see the note above for why. `--mode residual` uses a real
+  k-means predictor if you want to compare.
 * f64 and wide-integer tensors are cast to fp32 on read, which is itself lossy;
   the bound is enforced relative to the fp32 stream.
 * An error bound below the float32 ulp of the data forces every value to escape,

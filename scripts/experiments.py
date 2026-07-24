@@ -85,6 +85,7 @@ def run(name: str, source: str, out_dir: str, *, limit_bytes=None, **kw) -> dict
         "violations": bad,
         "values_checked": seen,
         "escapes": sum(c.n_outliers for c in stats.chunks),
+        "occupied_clusters": max((c.occupied_clusters for c in stats.chunks), default=0),
         "label_bytes": sum(c.label_bytes for c in stats.chunks),
         "code_bytes": sum(c.code_bytes for c in stats.chunks),
         "codebook_bytes": sum(c.codebook_bytes for c in stats.chunks),
@@ -125,51 +126,31 @@ def main() -> int:
         "tinyllama": os.path.join(md, "tinyllama.safetensors"),
     }
     groups = args.only.split(",") if args.only else \
-        ["models", "baseline", "tuple", "vq", "bound"]
+        ["models", "bound", "compare"]
     rows: list[dict] = []
     L = args.sweep_limit
 
     if "models" in groups:
-        print("\n[models] defaults: eb=1e-4, 128MB windows, tuple=2, k search by size")
+        print("\n[models] cluster mode, eb=1e-4 relative, 128MB windows -- k is the "
+              "number of clusters the search grows to")
         for name, path in models.items():
             if os.path.exists(path):
                 rows.append(run(f"model-{name}", path, args.out))
 
-    if "baseline" in groups:
-        print("\n[baseline] does the k-means predictor beat no predictor at all?")
-        for label, kw in [
-            ("k1-no-kmeans", dict(k_start=1, max_k=1)),
-            ("k64-fixed", dict(k_start=64, max_k=64)),
-            ("k1024-fixed", dict(k_start=1024, max_k=1024)),
-            ("k-search", dict()),
-        ]:
-            rows.append(run(f"baseline-{label}", models["gpt2"], args.out,
-                            limit_bytes=L, **kw))
-
-    if "tuple" in groups:
-        print("\n[tuple] a label costs log2(k)/T bits per value, so wider tuples")
-        print("        amortise it -- at what T does a codebook start to pay?")
-        for tsize in (1, 2, 4, 8, 16, 32, 64):
-            rows.append(run(f"tuple-{tsize:03d}", models["gpt2"], args.out,
-                            limit_bytes=L, tuple_size=tsize, max_k=1 << 14))
-        print("        and with the codebook forced on, to price it directly:")
-        for tsize in (2, 16, 64):
-            rows.append(run(f"forcedk-t{tsize:03d}", models["gpt2"], args.out,
-                            limit_bytes=L, tuple_size=tsize,
-                            k_start=256, max_k=256))
-
-    if "vq" in groups:
-        print("\n[vq] the literal rule: double k until pure VQ meets the bound")
-        rows.append(run("vq-criterion", models["gpt2"], args.out,
-                        limit_bytes=128 * MB, k_criterion="vq", max_k=1 << 14))
-        rows.append(run("vq-mode-pure", models["gpt2"], args.out,
-                        limit_bytes=128 * MB, mode="vq", k_start=256, max_k=256))
-
     if "bound" in groups:
-        print("\n[bound] error bound sweep")
-        for eb in (1e-3, 1e-4, 1e-5, 1e-6):
+        print("\n[bound] cluster count k vs the relative error bound (gpt2)")
+        for eb in (1e-2, 1e-3, 1e-4, 1e-5, 1e-6):
             rows.append(run(f"bound-{eb:.0e}", models["gpt2"], args.out,
                             limit_bytes=L, error_bound=eb))
+
+    if "compare" in groups:
+        print("\n[compare] the design's clustering vs the residual/vq variants (gpt2)")
+        rows.append(run("method-cluster", models["gpt2"], args.out, limit_bytes=L,
+                        mode="cluster"))
+        rows.append(run("method-residual", models["gpt2"], args.out, limit_bytes=L,
+                        mode="residual"))
+        rows.append(run("method-vq-pure", models["gpt2"], args.out, limit_bytes=L,
+                        mode="vq", k_start=256, max_k=256))
 
     with open(os.path.join(args.out, "summary.json"), "w") as fh:
         json.dump(rows, fh, indent=2)

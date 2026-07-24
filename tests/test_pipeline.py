@@ -39,38 +39,65 @@ def _max_error(got, x, mode):
     return float(a.max())
 
 
+#: (mode, error_mode, error metric) triples the codec must honour.
+BOUND_CASES = [
+    ("cluster", "relative", "relative"),
+    ("residual", "relative", "relative"),
+    ("residual", "absolute", "absolute"),
+]
+
+
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("mode", ["relative", "absolute"])
-def test_window_roundtrip_holds_the_bound(device, mode):
-    cfg = Config(error_bound=1e-4, error_mode=mode, window_size=1 << 20,
-                 max_k=256, device=device)
+@pytest.mark.parametrize("mode,error_mode,metric", BOUND_CASES)
+def test_window_roundtrip_holds_the_bound(device, mode, error_mode, metric):
+    cfg = Config(error_bound=1e-4, mode=mode, error_mode=error_mode,
+                 window_size=1 << 20, max_k=1 << 20, device=device)
     x = _weights(1 << 18)
     chunk, stats = compress_window(0, x, cfg, device)
     back = unpack_chunk(chunk)
     assert back.size == x.size
-    assert _max_error(back, x, mode) <= cfg.error_bound
+    assert _max_error(back, x, metric) <= cfg.error_bound
     assert stats.max_error <= cfg.error_bound
 
 
 @pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("mode", ["relative", "absolute"])
+@pytest.mark.parametrize("mode,error_mode,metric", BOUND_CASES)
 @pytest.mark.parametrize("tuple_size", [1, 2, 4])
-def test_tuple_sizes_roundtrip(device, mode, tuple_size):
-    cfg = Config(error_bound=1e-4, error_mode=mode, max_k=128,
-                 tuple_size=tuple_size, device=device)
+def test_tuple_sizes_roundtrip(device, mode, error_mode, metric, tuple_size):
+    cfg = Config(error_bound=1e-4, mode=mode, error_mode=error_mode,
+                 max_k=1 << 20, tuple_size=tuple_size, device=device)
     x = _weights(100_003, seed=tuple_size)  # prime length exercises padding
     chunk, _ = compress_window(0, x, cfg, device)
     back = unpack_chunk(chunk)
     assert back.size == x.size
-    assert _max_error(back, x, mode) <= cfg.error_bound
+    assert _max_error(back, x, metric) <= cfg.error_bound
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_relative_bound_is_scale_invariant(device):
+def test_cluster_k_is_the_cluster_count_and_grows_as_the_bound_tightens(device):
+    """k in cluster mode is the number of clusters, doubled from k_start until
+    the max percentage error meets the bound -- the design's algorithm."""
+    x = _weights(1 << 18, seed=5)
+    prev_k = 0
+    for eb in (1e-2, 1e-3, 1e-4):
+        cfg = Config(error_bound=eb, mode="cluster", window_size=1 << 20,
+                     k_start=64, max_k=1 << 22, device=device)
+        chunk, stats = compress_window(0, x, cfg, device)
+        assert stats.k >= 64 and (stats.k & (stats.k - 1)) == 0, "power of two >= 64"
+        assert stats.occupied_clusters <= stats.k
+        assert chunk.centroids.shape[0] == stats.occupied_clusters
+        assert _max_error(unpack_chunk(chunk), x, "relative") <= eb
+        assert stats.k > prev_k, "a tighter bound needs more clusters"
+        prev_k = stats.k
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("mode", ["cluster", "residual"])
+def test_relative_bound_is_scale_invariant(device, mode):
     """The whole point of a relative bound: the same tensor scaled by 1e6 must
     reconstruct to the same relative error and the same bitstream size."""
-    cfg = Config(error_bound=1e-4, error_mode="relative", window_size=1 << 20,
-                 max_k=64, device=device)
+    cfg = Config(error_bound=1e-4, mode=mode, error_mode="relative",
+                 window_size=1 << 20, max_k=1 << 20, device=device)
     x = _weights(1 << 18, seed=3)
     c_small, s_small = compress_window(0, x, cfg, device)
     c_big, s_big = compress_window(0, (x * 1e6).astype(np.float32), cfg, device)
@@ -81,9 +108,10 @@ def test_relative_bound_is_scale_invariant(device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_relative_signs_and_zeros_survive(device):
-    cfg = Config(error_bound=1e-4, error_mode="relative", window_size=1 << 20,
-                 max_k=64, device=device)
+@pytest.mark.parametrize("mode", ["cluster", "residual"])
+def test_relative_signs_and_zeros_survive(device, mode):
+    cfg = Config(error_bound=1e-4, mode=mode, error_mode="relative",
+                 window_size=1 << 20, max_k=1 << 20, device=device)
     rng = np.random.default_rng(9)
     x = rng.normal(0, 0.02, size=40_000).astype(np.float32)
     x[::7] *= -1                       # plenty of negatives
@@ -164,22 +192,22 @@ def test_k_equals_one_is_the_no_predictor_baseline(device):
     assert res.evaluation.label_entropy_bits == 0.0
 
 
-@pytest.mark.parametrize("mode", ["relative", "absolute"])
-def test_full_compress_decompress_roundtrip(tmp_path, mode):
+@pytest.mark.parametrize("mode,error_mode,metric", BOUND_CASES)
+def test_full_compress_decompress_roundtrip(tmp_path, mode, error_mode, metric):
     x = _weights(1 << 20, seed=7)
     src = str(tmp_path / "w.npy")
     np.save(src, x)
-    cfg = Config(error_bound=1e-4, error_mode=mode, window_size=1 << 20,
-                 max_k=256, output_dir=str(tmp_path), device=DEVICE)
+    tsize = 1 if mode == "cluster" else 2
+    cfg = Config(error_bound=1e-4, mode=mode, error_mode=error_mode,
+                 window_size=1 << 20, max_k=1 << 20, tuple_size=tsize,
+                 output_dir=str(tmp_path), device=DEVICE)
     path, stats = compress(src, cfg)
 
     assert len(stats.chunks) == 4, "1 MiB windows over a 4 MiB stream"
     assert stats.max_error <= cfg.error_bound
     back, header = decompress(path)
     assert back.size == x.size
-    assert _max_error(back, x, mode) <= cfg.error_bound
-    assert header["tuple_size"] == 2
-    assert header["error_mode"] == mode
+    assert _max_error(back, x, metric) <= cfg.error_bound
 
     tables = tmp_path / "w.kmeans"
     assert len(list(tables.iterdir())) == len(stats.chunks)

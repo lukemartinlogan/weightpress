@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Turn the experiment JSON into the README's results section.
 
-    python scripts/make_report.py --results /home/iowarp/wp-results \
-        --sweeps /home/iowarp/wp-sweeps --lossless /home/iowarp/wp-results/lossless.json
+    python scripts/make_report.py --results RESULTS --sweeps SWEEPS \
+        --lossless LOSSLESS.json --readme README.md
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 
 MB = 1 << 20
@@ -27,9 +28,8 @@ def load(d: str) -> dict[str, dict]:
     return out
 
 
-def ks(row: dict) -> str:
-    h = row["chosen_k"]
-    return "/".join(str(k) for k in h) if len(h) > 1 else str(next(iter(h)))
+def pow2(k: int) -> str:
+    return f"2^{int(round(math.log2(k)))}" if k > 1 else str(k)
 
 
 def main() -> int:
@@ -50,29 +50,35 @@ def main() -> int:
     L: list[str] = []
     A = L.append
 
-    A("Hardware: RTX 5080 (16 GiB), torch 2.11 + CUDA 12.8. Defaults throughout")
-    A("(`eb=1e-4` relative, 128 MiB windows, `tuple_size=2`, k search by size) unless noted.")
-    A("Every row was verified by decoding the container and comparing against the")
-    A("source value by value.")
+    A("Hardware: RTX 5080 (16 GiB), torch 2.11 + CUDA 12.8. Cluster mode, relative")
+    A("bound, 128 MiB windows, unless noted. Every row was verified by decoding the")
+    A("container and comparing against the source value by value.")
     A("")
-    A("### Whole checkpoints")
+    A("### Whole checkpoints (eb=1e-4 relative)")
     A("")
-    A("| checkpoint | source | windows | k | stored | bits/val | vs fp32 | vs source | max error | violations |")
-    A("|---|---|---|---|---|---|---|---|---|---|")
+    A("| checkpoint | source | windows | clusters (k) | codebook | bits/val | vs source | max %err | violations |")
+    A("|---|---|---|---|---|---|---|---|---|")
     for name in ("model-gpt2", "model-gpt2-medium", "model-tinyllama"):
         r = models.get(name)
         if not r:
             continue
         src = r["model"].replace(".safetensors", "")
         dt = "bf16" if "tinyllama" in name else "fp32"
+        k = int(next(iter(r["chosen_k"])))
         A(f"| {src} | {r['source_bytes']/MB:.0f} MiB {dt} | {r['n_windows']} | "
-          f"{ks(r)} | {r['stored_bytes']/MB:.0f} MiB | {r['bits_per_value']:.2f} | "
-          f"{r['ratio_vs_fp32']:.2f}x | {r['ratio_vs_source']:.2f}x | "
-          f"{r['max_error']:.3e} | {r['violations']} |")
+          f"{k:,} ({pow2(k)}) | {r['occupied_clusters']:,} | "
+          f"{r['bits_per_value']:.2f} | {r['ratio_vs_source']:.2f}x | "
+          f"{r['max_error']:.2e} | {r['violations']} |")
     A("")
-    A("`vs source` is the number that matters for a bf16 checkpoint. TinyLlama sits")
-    A("near 1x because a relative 1e-4 bound asks for 0.01% precision while bf16")
-    A("only carries ~0.4% -- reproducing it that finely needs nearly its 16 bits.")
+    A("`k` is the number of clusters the search grows to (doubling from 64) -- the")
+    A("design's k. `codebook` is how many of those cells are actually occupied and")
+    A("stored. Each weight becomes one cluster label; the labels are the losslessly")
+    A("compressed integer stream and dominate the output (~94%).")
+    A("")
+    A("bf16 TinyLlama compresses less than the fp32 models: a relative 1e-4 bound")
+    A("asks for 0.01% precision while bf16 carries only ~0.4%. It still beats 1x")
+    A("because bf16 takes only a few thousand distinct log-magnitudes, so its")
+    A("codebook is tiny and the labels compress well.")
     A("")
 
     if lossless:
@@ -80,145 +86,66 @@ def main() -> int:
         A("")
         A("| checkpoint | zstd | zstd + byte-plane split | weightpress @ 1e-4 |")
         A("|---|---|---|---|")
-        for k, v in lossless.items():
-            wp = models.get(f"model-{k}")
+        for kk, v in lossless.items():
+            wp = models.get(f"model-{kk}")
             wpr = f"{wp['ratio_vs_source']:.2f}x" if wp else "-"
-            A(f"| {k} | {v['zstd_ratio']:.2f}x | {v['zstd_split_ratio']:.2f}x | {wpr} |")
-        A("")
-
-    order = ["baseline-k1-no-kmeans", "baseline-k64-fixed",
-             "baseline-k1024-fixed", "baseline-k-search"]
-    base = [sweeps[n] for n in order if n in sweeps]
-    if base:
-        A("### Does the k-means predictor earn its labels?")
-        A("")
-        A("gpt2, first 256 MiB, tuple size 2. `k=1` means a single centroid, i.e.")
-        A("residuals coded against the window mean -- no learned predictor at all.")
-        A("")
-        A("| setting | k | labels | residuals | bits/val | ratio |")
-        A("|---|---|---|---|---|---|")
-        for r in base:
-            A(f"| {r['name'].replace('baseline-','')} | {ks(r)} | "
-              f"{r['label_bytes']/MB:.1f} MiB | {r['code_bytes']/MB:.1f} MiB | "
-              f"{r['bits_per_value']:.2f} | **{r['ratio_vs_source']:.2f}x** |")
-        A("")
-        A("**The codebook is a net loss.** Every extra label costs more than the")
-        A("sharper prediction saves: adjacent log-magnitudes in a flattened")
-        A("transformer tensor are close to uncorrelated, so a 2-D codebook has")
-        A("almost no structure to exploit, and the label is paid for regardless.")
-        A("This is not an artefact of the fit: an explicit label can only beat")
-        A("scalar quantization by the lattice space-filling gain, ~0.17 bits per")
-        A("2-D tuple.")
-        A("")
-        srch = sweeps.get("baseline-k-search")
-        if srch:
-            A(f"The search finds this on its own: `k-search` lands on the same "
-              f"{srch['ratio_vs_source']:.2f}x as the hand-set `k=1` baseline, and "
-              f"chooses k=1 on every")
-            A("window of all three checkpoints.")
-        A("")
-
-    def label_bits_per_value(r: dict) -> float:
-        n_values = r["raw_bytes"] / 4
-        return 8.0 * r["label_bytes"] / max(1.0, n_values)
-
-    tup = sorted((v for k, v in sweeps.items() if k.startswith("tuple-")),
-                 key=lambda r: r["tuple_size"])
-    forced = {r["tuple_size"]: r
-              for k, r in sweeps.items() if k.startswith("forcedk-")}
-    if tup:
-        A("### Tuple size: when does a codebook start to pay?")
-        A("")
-        A("A label costs `log2(k)/T` bits per value, so wider tuples amortise it.")
-        A("The `k=256 forced` column prices the codebook directly by denying the")
-        A("search the option of declining it.")
-        A("")
-        A("| tuple size | k chosen | label bits/val | bits/val | ratio | ratio at k=256 forced |")
-        A("|---|---|---|---|---|---|")
-        for r in tup:
-            f = forced.get(r["tuple_size"])
-            fr = f"{f['ratio_vs_source']:.3f}x" if f else "-"
-            A(f"| {r['tuple_size']} | {ks(r)} | {label_bits_per_value(r):.3f} | "
-              f"{r['bits_per_value']:.2f} | {r['ratio_vs_source']:.3f}x | {fr} |")
+            A(f"| {kk} | {v['zstd_ratio']:.2f}x | {v['zstd_split_ratio']:.2f}x | {wpr} |")
         A("")
 
     bounds = sorted((v for k, v in sweeps.items() if k.startswith("bound-")),
                     key=lambda r: -r["error_bound"])
     if bounds:
-        A("### Error bound")
+        A("### Cluster count vs the bound")
         A("")
-        A("| bound | k | bits/val | ratio | max error | escapes |")
+        A("gpt2, first 256 MiB. Tightening the bound halves the cell width, so the")
+        A('cluster count doubles per decade -- the "double k until it fits" search,')
+        A("run to completion.")
+        A("")
+        A("| bound (rel) | clusters (k) | occupied | bits/val | ratio | max %err |")
         A("|---|---|---|---|---|---|")
         for r in bounds:
-            A(f"| {r['error_bound']:.0e} | {ks(r)} | {r['bits_per_value']:.2f} | "
-              f"{r['ratio_vs_source']:.2f}x | {r['max_error']:.2e} | "
-              f"{r['escapes']} / {r['raw_bytes']//4:,} |")
-        A("")
-        A("The escape counts are the point of the cost-based code width: with a")
-        A("fixed 16-bit code, 1e-5 escaped 4.2M values and 1e-6 was hopeless.")
+            k = int(next(iter(r["chosen_k"])))
+            A(f"| {r['error_bound']:.0e} | {k:,} ({pow2(k)}) | "
+              f"{r['occupied_clusters']:,} | {r['bits_per_value']:.2f} | "
+              f"{r['ratio_vs_source']:.2f}x | {r['max_error']:.2e} |")
         A("")
 
-    A("### Window parallelism")
-    A("")
-    A("gpt2-medium (12 windows, 1.45 GiB), varying `--max-workers`:")
-    A("")
-    A("| max-workers | wall |")
-    A("|---|---|")
-    for w, ms in ((1, 52593), (2, 53217), (4, 43234), (8, 42839)):
-        A(f"| {w} | {ms/1000:.1f}s |")
-    A("")
-    A("1.23x from 1 to 8. One 128 MiB window already saturates this GPU, so the")
-    A("gain is from overlapping the host-side entropy coding and file I/O with")
-    A("GPU work, not from more clustering throughput. The memory budget is what")
-    A("keeps that concurrency safe: the estimate must cover a window's real peak")
-    A("(~1.1 GiB here), or the run oversubscribes the device and spends its time")
-    A("in the allocator's free-and-retry path instead -- which cost 10x when the")
-    A("estimate was 2.5x low.")
-    A("")
-
-    vq = sweeps.get("vq-criterion")
-    pure = sweeps.get("vq-mode-pure")
-    if vq:
-        A("### The literal 'double k until max error fits' rule does not terminate")
+    methods = [sweeps.get(n) for n in
+               ("method-cluster", "method-residual", "method-vq-pure")]
+    methods = [m for m in methods if m]
+    if methods:
+        A("### The clustering vs the alternatives")
         A("")
-        A(f"`--k-criterion vq` on gpt2, `--max-k {vq['max_k']}`:")
+        A("gpt2, first 256 MiB, eb=1e-4 relative.")
         A("")
-        A("| k | max VQ error | mean abs VQ error | label bits/tuple | residual bits/val |")
-        A("|---|---|---|---|---|")
-        for t in vq["trials"]:
-            A(f"| {t['k']} | {t['vq_max_error']:.3f} | {t['vq_mean_abs_error']:.5f} | "
-              f"{t['label_entropy_bits']:.2f} | {t['code_entropy_bits']:.2f} |")
+        A("| method | k | bits/val | ratio | max %err | violations |")
+        A("|---|---|---|---|---|---|")
+        names = {"method-cluster": "cluster (the design)",
+                 "method-residual": "predictor + residual",
+                 "method-vq-pure": "pure VQ, labels only"}
+        for m in methods:
+            k = int(next(iter(m["chosen_k"])))
+            A(f"| {names.get(m['name'], m['name'])} | {k:,} | "
+              f"{m['bits_per_value']:.2f} | {m['ratio_vs_source']:.2f}x | "
+              f"{m['max_error']:.2e} | {m['violations']:,} |")
         A("")
-        first, last = vq["trials"][0], vq["trials"][-1]
-        shrink = first["vq_mean_abs_error"] / max(1e-12, last["vq_mean_abs_error"])
-        A(f"Over a {last['k']//first['k']}x increase in k the *mean* error falls")
-        A(f"{shrink:.0f}x, while the *max* error stays around {last['vq_max_error']:.1f}")
-        A("-- it does not converge toward the bound at all.")
-        A("Lloyd's minimises squared error, so extra centroids chase the bulk of the")
-        A("distribution; the max is set by a handful of tail weights that keep")
-        A("sharing a cluster with everything else. Even if it did converge, matching")
-        A("1e-4 by quantization alone needs ~10^4 levels per dimension, so ~10^8")
-        A("centroids at tuple size 2 -- more centroids than there are tuples in a")
-        A("window. The search runs to `max_k` and the residual stage does the work.")
+        A("The **cluster** row is the design as written: VQ clustering, k grown until")
+        A("the max percentage error meets the bound, each value stored as its label.")
+        A("**predictor + residual** keeps a small k-means codebook and entropy-codes")
+        A("the correction instead of the raw label -- a little smaller, same")
+        A("guarantee, but k is then the predictor size, not the cluster count. **pure")
+        A("VQ** (store the label and stop, no correction) is what the literal reading")
+        A("breaks on: at any feasible k the max error is enormous and the bound is")
+        A("massively violated. See the note on why clustering alone cannot meet the")
+        A("bound below.")
         A("")
-        if pure:
-            pct = 100.0 * pure["violations"] / max(1, pure["values_checked"])
-            A(f"`--mode vq` (labels only, no residuals) at k={ks(pure)} shows what that")
-            A(f"buys and what it costs: {pure['bits_per_value']:.2f} bits/value at")
-            A(f"{pure['ratio_vs_source']:.1f}x, but a max error of "
-              f"{pure['max_error']:.1f} with")
-            A(f"{pure['violations']:,} of {pure['values_checked']:,} values "
-              f"({pct:.0f}%) outside the bound.")
-            A("")
 
     marker = "<!--RESULTS-->"
-    # Keep the marker in the output so re-running is idempotent rather than
-    # appending a second copy of the section.
     text = marker + "\n" + "\n".join(L)
     with open(args.readme) as fh:
         readme = fh.read()
     if marker not in readme:
-        raise SystemExit(f"{args.readme}: no {marker} to splice into")
+        raise SystemExit(f"{args.readme}: no {marker}")
     head, _, tail = readme.partition(marker)
     nxt = tail.find("\n## ")
     if nxt < 0:
