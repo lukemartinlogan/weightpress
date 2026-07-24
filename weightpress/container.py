@@ -65,11 +65,14 @@ class ContainerWriter:
             "labels_itemsize": chunk.labels_itemsize,
             "n_outliers": chunk.n_outliers,
             "step": chunk.step,
+            "error_mode": chunk.error_mode,
+            "sign_len": len(chunk.sign_blob),
             "centroid_bytes": int(cent.nbytes),
         }
         entry["code_plane_lens"] = [len(b) for b in chunk.code_plane_blobs]
         for blob in chunk.code_plane_blobs:
             self._fh.write(blob)
+        self._fh.write(chunk.sign_blob)
         for name in _BLOBS:
             blob = getattr(chunk, name)
             entry[name + "_len"] = len(blob)
@@ -120,6 +123,7 @@ class ContainerReader:
             self._fh.read(e["centroid_bytes"]), dtype=np.float32
         ).reshape(e["k"], e["tuple_size"])
         planes = [self._fh.read(n) for n in e["code_plane_lens"]]
+        sign_blob = self._fh.read(e.get("sign_len", 0))
         blobs = {name: self._fh.read(e[name + "_len"]) for name in _BLOBS}
         return EncodedChunk(
             index=e["index"],
@@ -131,7 +135,9 @@ class ContainerReader:
             labels_itemsize=e["labels_itemsize"],
             n_outliers=e["n_outliers"],
             step=e["step"],
+            error_mode=e.get("error_mode", "absolute"),
             code_plane_blobs=planes,
+            sign_blob=sign_blob,
             **blobs,
         )
 

@@ -33,13 +33,17 @@ __all__ = [
     "dequantize",
     "join_planes",
     "labels_dtype",
+    "log1p_step",
     "pack_chunk",
+    "pack_signs",
     "planes_needed",
     "quant_step",
     "quantize",
     "reconstruct",
+    "reconstruct_relative",
     "split_planes",
     "unpack_chunk",
+    "unpack_signs",
     "zigzag_decode",
     "zigzag_encode",
 ]
@@ -234,6 +238,40 @@ def dequantize(
     return out
 
 
+def log1p_step(error_bound: float, max_abs_log: float = 0.0) -> float:
+    """Log-domain grid width that yields a relative error at most ``error_bound``.
+
+    A residual within +/-d in log space reconstructs to a linear relative error
+    of ``exp(d) - 1``, so a full grid step of ``2 * ln(1 + eb)`` bounds it at
+    ``eb``.  The margin (finer grid) and the per-window magnitude guard come from
+    :func:`quant_step`, here applied in log space.
+    """
+    return quant_step(float(np.log1p(error_bound)), max_abs_log)
+
+
+def reconstruct_relative(
+    code: np.ndarray, pred_log: np.ndarray, step: float, sign: np.ndarray
+) -> np.ndarray:
+    """Decoder arithmetic for the relative (log-domain) path.
+
+    ``sign`` is +1.0 / -1.0 per value.  Must be bit-identical to what the encoder
+    checked against, so the same float32 ``exp`` runs on both sides.
+    """
+    u_hat = reconstruct(code, pred_log, step)
+    return (sign * np.exp(u_hat)).astype(np.float32)
+
+
+def pack_signs(neg: np.ndarray) -> bytes:
+    """Bit-pack a boolean 'is negative' mask (LSB-first)."""
+    return np.packbits(np.ascontiguousarray(neg, dtype=bool), bitorder="little").tobytes()
+
+
+def unpack_signs(blob: bytes, n: int) -> np.ndarray:
+    """Return +1.0 / -1.0 per value from a packed sign mask."""
+    bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8), bitorder="little")[:n]
+    return np.where(bits.astype(bool), np.float32(-1.0), np.float32(1.0))
+
+
 @dataclasses.dataclass
 class EncodedChunk:
     """One window's worth of compressed payload."""
@@ -248,14 +286,22 @@ class EncodedChunk:
     labels_itemsize: int
     #: Grid width used by this window; the decoder must reuse it exactly.
     step: float = 0.0
+    #: "relative" (log-domain) or "absolute" (linear grid).
+    error_mode: str = "absolute"
     code_plane_blobs: list[bytes] = dataclasses.field(default_factory=list)
     outlier_idx_blob: bytes = b""
     outlier_val_blob: bytes = b""
+    #: Bit-packed sign mask, only present in relative mode.
+    sign_blob: bytes = b""
     n_outliers: int = 0
 
     @property
     def n_planes(self) -> int:
         return len(self.code_plane_blobs)
+
+    @property
+    def sign_bytes(self) -> int:
+        return len(self.sign_blob)
 
     @property
     def codebook_bytes(self) -> int:
@@ -271,7 +317,7 @@ class EncodedChunk:
 
     @property
     def outlier_bytes(self) -> int:
-        return len(self.outlier_idx_blob) + len(self.outlier_val_blob)
+        return len(self.outlier_idx_blob) + len(self.outlier_val_blob) + len(self.sign_blob)
 
 
 def pack_chunk(
@@ -286,13 +332,16 @@ def pack_chunk(
     tuple_size: int,
     mode: str,
     step: float = 0.0,
+    error_mode: str = "absolute",
+    signs: np.ndarray | None = None,
     level: int = 3,
     planes: list[np.ndarray] | None = None,
 ) -> EncodedChunk:
     """Compress one window.
 
     In residual mode supply either ``zcodes`` (uint32 zigzag words) or
-    ``planes`` (uint8 byte planes already split by the GPU path).
+    ``planes`` (uint8 byte planes already split by the GPU path).  In relative
+    mode ``signs`` is a boolean 'is negative' mask over every value.
     """
     cctx = zstd.ZstdCompressor(level=level)
     k = int(centroids.shape[0])
@@ -308,7 +357,12 @@ def pack_chunk(
         labels_blob=cctx.compress(lab.tobytes()),
         labels_itemsize=ldt.itemsize,
         step=float(step),
+        error_mode=error_mode,
     )
+    if signs is not None:
+        # Signs are ~1 incompressible bit each, but zstd still trims the runs of
+        # same-sign weights that show up in practice.
+        chunk.sign_blob = cctx.compress(pack_signs(signs))
     if planes is None and zcodes is not None:
         z = np.ascontiguousarray(zcodes, dtype=np.uint32)
         planes = split_planes(z, planes_needed(int(z.max()) if z.size else 0))
@@ -358,5 +412,13 @@ def unpack_chunk(chunk: EncodedChunk) -> np.ndarray:
     else:
         oidx = np.empty(0, dtype=np.int64)
         ovals = np.empty(0, dtype=np.float32)
+
+    if chunk.error_mode == "relative":
+        n_padded = n_tuples * chunk.tuple_size
+        sign = unpack_signs(dctx.decompress(chunk.sign_blob), n_padded)
+        out = reconstruct_relative(zigzag_decode(z), pred, chunk.step, sign)
+        if oidx.size:
+            out[oidx] = ovals
+        return out[: chunk.n_values]
 
     return dequantize(z, pred, chunk.step, oidx, ovals)[: chunk.n_values]

@@ -30,9 +30,13 @@ MB = 1 << 20
 
 
 def verify(container: str, source: str) -> tuple[float, int, int]:
-    """Re-read source and container together; returns (max_err, violations, n)."""
+    """Re-read source and container together; returns (max_err, violations, n).
+
+    Error is measured relative when the container declares a relative bound.
+    """
     with ContainerReader(container) as r:
         eb = r.header["error_bound"]
+        relative = r.header.get("error_mode", "absolute") == "relative"
         vpw = r.header["window_size"] // 4
         stream = WeightStream.open(source)
         worst, bad, seen = 0.0, 0, 0
@@ -41,7 +45,10 @@ def verify(container: str, source: str) -> tuple[float, int, int]:
                 break
             got = unpack_chunk(r.read_chunk(i))
             m = min(got.size, original.size)
-            err = np.abs(got[:m].astype(np.float64) - original[:m].astype(np.float64))
+            o = original[:m].astype(np.float64)
+            err = np.abs(got[:m].astype(np.float64) - o)
+            if relative:
+                err = np.divide(err, np.abs(o), out=np.zeros_like(err), where=o != 0)
             worst = max(worst, float(err.max()) if m else 0.0)
             bad += int((err > eb).sum())
             seen += m

@@ -28,11 +28,16 @@ from .codec import (
     EncodedChunk,
     choose_plane_width,
     labels_dtype,
+    log1p_step,
     pack_chunk,
     plane_limit,
+    plane_stats,
     planes_needed,
     quant_step,
+    reconstruct_relative,
+    split_planes,
     unpack_chunk,
+    zigzag_decode,
 )
 from .config import CODE_MAX, MAX_CODE_PLANES, Config
 from .container import ContainerReader, ContainerWriter, write_codebook_sidecar
@@ -77,19 +82,36 @@ def warmup(device: str) -> None:
     torch().cuda.synchronize()
 
 
-def _to_tuples(x: np.ndarray, tuple_size: int, device: str):
-    """Upload one window and view it as (n_tuples, tuple_size), padding by edge
-    replication so the tail tuple is still cheap to predict."""
+def _upload(x: np.ndarray, tuple_size: int, device: str):
+    """Upload one window as a flat fp32 tensor, edge-padded to a whole tuple."""
     t = torch()
-    n = x.size
-    rem = (-n) % tuple_size
+    rem = (-x.size) % tuple_size
     dev = t.from_numpy(np.ascontiguousarray(x, dtype=np.float32).copy()).to(
         device, non_blocking=True
     )
     if rem:
-        pad = dev[-1:].repeat(rem)
-        dev = t.cat([dev, pad])
-    return dev.view(-1, tuple_size)
+        dev = t.cat([dev, dev[-1:].repeat(rem)])
+    return dev
+
+
+def _to_tuples(x: np.ndarray, tuple_size: int, device: str):
+    """The feature the k-means and residual stages see: raw weights as tuples."""
+    return _upload(x, tuple_size, device).view(-1, tuple_size)
+
+
+def _to_log_tuples(x: np.ndarray, tuple_size: int, device: str):
+    """Relative mode works in the log domain, where an absolute residual bound
+    becomes a relative one.  Returns ``(u2d, raw, sign, escaped)``: log|x| as
+    tuples for the predictor, plus the flat linear values, per-value sign, and
+    the escape mask for values (zeros, non-finite) that have no useful log."""
+    t = torch()
+    raw = _upload(x, tuple_size, device)
+    absx = raw.abs()
+    escaped = (raw == 0) | ~t.isfinite(raw)
+    # Clamp only so log() is finite on escaped lanes; those lanes are overwritten.
+    u = t.log(t.where(escaped, t.ones_like(absx), absx))
+    sign = raw < 0
+    return u.view(-1, tuple_size), raw, sign, escaped
 
 
 def _quantize_gpu(x2d, centroids, labels, error_bound: float, k: int):
@@ -179,6 +201,77 @@ def _quantize_gpu(x2d, centroids, labels, error_bound: float, k: int):
     )
 
 
+def _quantize_gpu_relative(u2d, raw, sign, escaped, centroids, labels, eb, k):
+    """Log-domain residual quantization for a relative (max percentage) bound.
+
+    ``centroids`` predict ``log|x|``.  A residual within +/-step/2 in log space
+    is a relative error of ``exp(step/2)-1``, so ``step = 2*ln(1+eb)`` bounds it.
+
+    The GPU rounds each log-residual to the grid; the authoritative
+    reconstruct-and-check runs on the CPU with the decoder's exact numpy ``exp``
+    (:func:`_finalize_relative`).  Checking with the same ``exp`` the decoder
+    uses is what makes the bound hold -- the GPU ``exp`` differs from numpy's by
+    a few ULP, which at a tight bound is enough to cross it.
+
+    Returns ``(planes, oidx, oval, max_rel_err, mean_rel_err, step, sign_np)``.
+    """
+    t = torch()
+    n, tsize = u2d.shape
+    n_values = n * tsize
+    finite = u2d[t.isfinite(u2d)]
+    max_abs_log = float(finite.abs().max().item()) if finite.numel() else 0.0
+    step = log1p_step(eb, max_abs_log)
+
+    zcodes = t.empty(n_values, dtype=t.int32, device=u2d.device)
+    tile = km._resid_tile(n, tsize)
+    for a in range(0, n, tile):
+        b = min(n, a + tile)
+        pred = centroids[labels[a:b]]
+        q = t.round((u2d[a:b].double() - pred.double()) / step)
+        over = (q < -CODE_MAX) | (q > CODE_MAX - 1) | ~t.isfinite(q)
+        q = t.where(over, t.zeros_like(q), q).to(t.int32)
+        code = t.where(over, t.zeros_like(q), t.where(q >= 0, q + 1, q))
+        zcodes[a * tsize : b * tsize] = ((code << 1) ^ (code >> 31)).reshape(-1)
+
+    pred_flat = centroids[labels].reshape(-1).cpu().numpy()
+    return _finalize_relative(
+        zcodes.cpu().numpy().astype(np.uint32),
+        pred_flat,
+        sign.reshape(-1).cpu().numpy(),
+        escaped.reshape(-1).cpu().numpy(),
+        raw.cpu().numpy(),
+        step, eb, n_values,
+    )
+
+
+def _finalize_relative(z, pred_log, neg, escaped, raw, step, eb, n_values):
+    """CPU, decoder-exact: reconstruct, escape every value still over the bound,
+    then choose the code width.  Because this uses the same numpy ``exp`` the
+    decoder does, a value that passes here cannot fail on decode."""
+    sign = np.where(neg, np.float32(-1.0), np.float32(1.0))
+    code = zigzag_decode(z)
+    x_hat = reconstruct_relative(code, pred_log, step, sign)
+    absraw = np.abs(raw.astype(np.float64))
+    rel = np.abs(x_hat.astype(np.float64) - raw.astype(np.float64)) / np.maximum(absraw, 1e-300)
+    bad = escaped | (raw == 0) | ~np.isfinite(raw) | (rel > eb)
+
+    # Escape overflow past the chosen code width, same cost trade-off as linear.
+    z = np.where(bad, 0, z).astype(np.uint32)
+    width = choose_plane_width(*plane_stats(z))
+    limit = plane_limit(width)
+    if limit is not None:
+        wide = z >= limit
+        bad |= wide
+        z = np.where(bad, 0, z).astype(np.uint32)
+
+    oidx = np.flatnonzero(bad).astype(np.uint32)
+    oval = raw[bad].astype(np.float32)
+    rel_stored = np.where(bad, 0.0, rel)  # escapes reconstruct exactly
+    planes = split_planes(z, planes_needed(int(z.max()) if z.size else 0))
+    return (planes, oidx, oval, float(rel_stored.max()),
+            float(rel_stored.mean()), step, neg)
+
+
 def _plane_stats_gpu(z, n_values: int):
     """Device-side equivalent of :func:`codec.plane_stats`."""
     t = torch()
@@ -217,10 +310,16 @@ def compress_window(
     t0 = time.time()
     n_values = int(values.size)
 
+    # Pure-VQ mode is a demonstration of the linear construction; it has no
+    # residual stage to carry a relative bound, so it stays in linear space.
+    relative = cfg.error_mode == "relative" and cfg.mode != "vq"
     with _stream_ctx(device):
         gen = t.Generator(device=device)
         gen.manual_seed(cfg.seed + index)
-        x2d = _to_tuples(values, cfg.tuple_size, device)
+        if relative:
+            x2d, raw, sign, escaped = _to_log_tuples(values, cfg.tuple_size, device)
+        else:
+            x2d = _to_tuples(values, cfg.tuple_size, device)
 
         res = km.search_k(x2d, cfg, generator=gen)
         k = int(res.centroids.shape[0])
@@ -229,6 +328,7 @@ def compress_window(
         # and the transfer dominated the window at k=64.
         narrow = {1: t.uint8, 2: t.int16, 4: t.int32}[labels_dtype(k).itemsize]
         labels_np = res.labels.to(narrow).cpu().numpy().view(labels_dtype(k))
+        vq_max, vq_mean = res.evaluation.vq_max_error, res.evaluation.vq_mean_abs_error
 
         if cfg.mode == "vq":
             vq_max, vq_mean = _vq_error(x2d, res.centroids, res.labels, k)
@@ -239,15 +339,28 @@ def compress_window(
                 mode=cfg.mode, level=cfg.zstd_level,
             )
             max_err, mean_err, n_out = vq_max, vq_mean, 0
+        elif relative:
+            planes, oidx, oval, max_err, mean_err, step, signs = _quantize_gpu_relative(
+                x2d, raw, sign, escaped, res.centroids, res.labels, cfg.error_bound, k
+            )
+            # The search minimised log-domain error; report it as relative too.
+            vq_max, vq_mean = float(np.expm1(vq_max)), float(np.expm1(vq_mean))
+            chunk = pack_chunk(
+                index, centroids_np, labels_np, None, oidx, oval,
+                n_values=n_values, tuple_size=cfg.tuple_size, mode=cfg.mode,
+                step=step, error_mode="relative", signs=signs,
+                level=cfg.zstd_level, planes=planes,
+            )
+            n_out = int(oidx.size)
         else:
             planes, oidx, oval, max_err, mean_err, step = _quantize_gpu(
                 x2d, res.centroids, res.labels, cfg.error_bound, k
             )
-            vq_max, vq_mean = res.evaluation.vq_max_error, res.evaluation.vq_mean_abs_error
             chunk = pack_chunk(
                 index, centroids_np, labels_np, None, oidx, oval,
                 n_values=n_values, tuple_size=cfg.tuple_size,
-                mode=cfg.mode, step=step, level=cfg.zstd_level, planes=planes,
+                mode=cfg.mode, step=step, error_mode="absolute",
+                level=cfg.zstd_level, planes=planes,
             )
             n_out = int(oidx.size)
 
@@ -326,6 +439,7 @@ def compress(
         "tuple_size": cfg.tuple_size,
         "window_size": cfg.window_size,
         "mode": cfg.mode,
+        "error_mode": cfg.error_mode,
         "device": device_name(device),
         "source": stream.manifest(),
     }

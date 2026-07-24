@@ -23,6 +23,9 @@ CODE_MAX = (1 << 30) - 1
 
 KCriterion = Literal["size", "vq"]
 Mode = Literal["residual", "vq"]
+#: ``relative`` enforces |x - x_hat| / |x| <= eb (max percentage error) by coding
+#: in the log domain; ``absolute`` enforces |x - x_hat| <= eb on a linear grid.
+ErrorMode = Literal["relative", "absolute"]
 
 
 @dataclasses.dataclass
@@ -36,6 +39,9 @@ class Config:
 
     # --- the five documented inputs -------------------------------------
     error_bound: float = 1e-4
+    #: Whether ``error_bound`` is a relative (max percentage) or absolute bound.
+    #: The design's bound is relative, so that is the default.
+    error_mode: ErrorMode = "relative"
     window_size: int = 128 << 20
     tuple_size: int = 2
     max_gpu_memory: int | None = None  # None -> 80% of free at startup

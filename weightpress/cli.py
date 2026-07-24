@@ -169,6 +169,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     with ContainerReader(args.container) as reader:
         header = reader.header
         eb = header["error_bound"]
+        relative = header.get("error_mode", "absolute") == "relative"
         src_path = args.source or header["source"]["path"]
         stream = WeightStream.open(src_path, dtype=args.dtype)
         vpw = header["window_size"] // 4
@@ -182,7 +183,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 break
             got = unpack_chunk(reader.read_chunk(i))
             m = min(got.size, original.size)
-            err = np.abs(got[:m].astype(np.float64) - original[:m].astype(np.float64))
+            g = got[:m].astype(np.float64)
+            o = original[:m].astype(np.float64)
+            err = np.abs(g - o)
+            if relative:
+                # Relative error is undefined at o==0; those are stored exactly,
+                # so define their error as 0 (err is already 0 there).
+                err = np.divide(err, np.abs(o), out=np.zeros_like(err), where=o != 0)
             worst = max(worst, float(err.max()) if m else 0.0)
             # Strict: the bound is a hard contract, so no tolerance is allowed.
             n_over += int((err > eb).sum())
@@ -190,7 +197,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
             n_windows += 1
 
     print(f"  checked        {n_seen} values across {n_windows} windows")
-    print(f"  bound          {eb:.3e}")
+    print(f"  bound          {eb:.3e}  ({'relative' if relative else 'absolute'})")
     print(f"  max error      {worst:.6e}")
     print(f"  violations     {n_over}")
     ok = n_over == 0
