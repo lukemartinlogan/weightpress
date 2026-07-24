@@ -261,7 +261,8 @@ def compress(
         else default_budget(device)
     )
     per_window = estimate_window_bytes(
-        values_per_window, cfg.tuple_size, km.DIST_BUFFER_BYTES
+        values_per_window, cfg.tuple_size, km.DIST_BUFFER_BYTES,
+        km.RESID_TILE_VALUES,
     )
     concurrency = plan_concurrency(budget, per_window, cfg.max_workers)
 

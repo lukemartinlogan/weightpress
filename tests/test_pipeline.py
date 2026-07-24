@@ -10,7 +10,7 @@ torch = pytest.importorskip("torch")
 from weightpress import kmeans as km
 from weightpress.codec import unpack_chunk
 from weightpress.config import Config
-from weightpress.gpu import plan_concurrency, resolve_device
+from weightpress.gpu import estimate_window_bytes, plan_concurrency, resolve_device
 from weightpress.pipeline import compress, compress_window, decompress
 
 DEVICE = resolve_device("cuda")
@@ -133,3 +133,14 @@ def test_concurrency_is_capped_by_the_memory_budget():
                             max_workers=8) == 1, "always make progress"
     assert plan_concurrency(budget_bytes=1 << 40, per_window_bytes=1 << 20,
                             max_workers=8) == 8, "respect max_workers"
+
+
+def test_window_estimate_covers_the_observed_footprint():
+    """A 128 MiB fp32 window measured ~1.5 GiB peak per worker on the RTX 5080.
+    The estimate must not come in under that, or plan_concurrency oversubscribes
+    the device and the run stalls in the allocator."""
+    est = estimate_window_bytes(
+        n_values=(128 << 20) // 4, tuple_size=2,
+        dist_buffer=km.DIST_BUFFER_BYTES, resid_tile_values=km.RESID_TILE_VALUES,
+    )
+    assert est >= 1 << 30, f"estimate {est/2**30:.2f} GiB is too optimistic"

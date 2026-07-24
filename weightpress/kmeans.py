@@ -32,9 +32,11 @@ from .gpu import torch
 
 #: Bytes for the (points x centroids) distance tile that dominates assignment.
 DIST_BUFFER_BYTES = 256 << 20
-#: Residual passes only need an (m x tuple_size) tile, so they can use far
-#: bigger strides than assignment -- fewer kernel launches, fewer stalls.
-RESID_TILE_VALUES = 1 << 26
+#: Values per tile in the residual passes.  These carry a dozen live temporaries
+#: (some float64), so a tile sized like the whole window would put ~1 GiB of
+#: scratch per worker in the allocator and, times max_workers, walk the device
+#: to its limit.  8M values keeps a worker's scratch in the low hundreds of MiB.
+RESID_TILE_VALUES = 1 << 23
 #: Residual codes are histogrammed over +/- this many bins; the tails beyond it
 #: are lumped in.  This only feeds the k decision, never the stored size.
 HIST_HALF = 1 << 15
@@ -101,10 +103,11 @@ def assign(x, centroids, *, want_dist: bool = False):
 
 
 def fit(x, k: int, cfg: Config, *, generator=None):
-    """Lloyd's algorithm on a subsample of ``x``; returns ``(k, tuple_size)``.
+    """Lloyd's algorithm on a subsample of ``x``.
 
-    Empty clusters are reseeded onto the points that are currently worst-fit,
-    which is what pushes the *max* error down rather than just the mean.
+    Returns the centroid table, shaped ``(k, tuple_size)``.  Empty clusters are
+    reseeded onto the points that are currently worst-fit, which is the only
+    part of the fit that pushes on the *max* error rather than the mean.
     """
     t = torch()
     n = x.shape[0]
@@ -201,9 +204,12 @@ def evaluate(x, centroids, labels, cfg: Config, k: int) -> Evaluation:
 def search_k(x, cfg: Config, *, generator=None) -> KMeansResult:
     """Find the smallest power-of-two k that satisfies the configured rule.
 
-    ``k=1`` is legal and is the useful baseline: one centroid means the residual
-    is coded against the window mean, i.e. plain scalar quantization with no
-    learned predictor at all.
+    ``k=1`` means a single centroid, so the residual is coded against the window
+    mean -- scalar quantization with no learned predictor.  Under the ``size``
+    rule it is always priced alongside the doubling sequence, because a label is
+    only worth paying for if the sharper prediction saves more than the label
+    costs, and on real weight tensors that is frequently not true.  A search
+    that only ever doubled from 64 could not discover it.
     """
     n = x.shape[0]
     k = max(1, 1 << int(math.log2(max(1, cfg.k_start))))
@@ -212,29 +218,37 @@ def search_k(x, cfg: Config, *, generator=None) -> KMeansResult:
     best_centroids = None
     best_labels = None
     best_eval: Evaluation | None = None
-    stale = 0
 
-    while True:
-        centroids = fit(x, k, cfg, generator=generator)
+    def consider(candidate_k: int) -> Evaluation:
+        nonlocal best_centroids, best_labels, best_eval
+        centroids = fit(x, candidate_k, cfg, generator=generator)
         labels, _ = assign(x, centroids)
         ev = evaluate(x, centroids, labels, cfg, centroids.shape[0])
         trials.append(ev)
-
         if cfg.k_criterion == "vq":
-            # Keep the newest: larger k always has lower or equal VQ error.
-            take, stop = True, ev.vq_max_error <= cfg.error_bound
+            take = True  # larger k never has higher VQ error; keep the newest
         else:
             take = (
                 best_eval is None
                 or ev.est_bytes < best_eval.est_bytes * (1.0 - cfg.min_k_gain)
             )
-            # Payload-vs-k is not perfectly monotone, so give the search a
-            # couple of doublings of patience before concluding it has peaked.
-            stale = 0 if take else stale + 1
-            stop = stale > cfg.k_patience
-
         if take:
             best_centroids, best_labels, best_eval = centroids, labels, ev
+        return ev
+
+    if cfg.k_criterion == "size" and k > 1:
+        consider(1)
+
+    stale = 0
+    while True:
+        ev = consider(k)
+        if cfg.k_criterion == "vq":
+            stop = ev.vq_max_error <= cfg.error_bound
+        else:
+            # Payload-vs-k is not perfectly monotone, so give the search a
+            # couple of doublings of patience before concluding it has peaked.
+            stale = 0 if best_eval is ev else stale + 1
+            stop = stale > cfg.k_patience
 
         if stop or k * 2 > cfg.max_k or k >= n:
             break

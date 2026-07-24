@@ -71,12 +71,23 @@ def plan_concurrency(
     return max(1, min(max_workers, fits))
 
 
-def estimate_window_bytes(n_values: int, tuple_size: int, dist_buffer: int) -> int:
+def estimate_window_bytes(
+    n_values: int, tuple_size: int, dist_buffer: int, resid_tile_values: int
+) -> int:
     """Peak device memory for one window.
 
-    Holds the fp32 window, the int64 label vector, a scratch copy used during
-    assignment, and the distance tile that dominates the k-means inner loop.
+    Counts the fp32 window and its padded copy, the int64 label vector, the two
+    output byte planes plus the escape mask, the distance tile that dominates
+    the k-means inner loop, and the residual-pass scratch.
+
+    The last term is the one that is easy to get wrong: a residual tile carries
+    roughly a dozen live temporaries, several of them float64, so it costs far
+    more than the tile itself.  Underestimating it lets ``plan_concurrency``
+    admit more workers than fit, and the run ends up in the allocator's
+    free-and-retry path instead of doing work.
     """
     data = n_values * 4
     labels = (n_values // max(1, tuple_size)) * 8
-    return int(data * 2 + labels * 2 + dist_buffer)
+    planes = n_values * 3  # low plane + high plane + escape mask
+    scratch = resid_tile_values * 12 * 4  # ~12 temporaries, f64 counted twice
+    return int(data * 2 + labels + planes + dist_buffer + scratch)

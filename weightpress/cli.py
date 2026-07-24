@@ -97,8 +97,9 @@ def _report(run, cfg: Config, out_path: str) -> None:
     print(f"  container      {out_path}")
     print(f"  k-means tables {os.path.splitext(out_path)[0]}.kmeans/ "
           f"({len(run.chunks)} chunk tables)")
-    print(f"  windows        {len(run.chunks)}  x  {_human(cfg.window_size)}"
-          f"   ({run.concurrency} in flight)")
+    print(f"  windows        {len(run.chunks)}  x  {_human(cfg.window_size)}")
+    print(f"  gpu budget     {_human(run.gpu_budget_bytes)}"
+          f"   ({run.concurrency} windows in flight)")
     print(f"  chosen k       {run.k_histogram()}")
     print(f"  raw            {_human(run.raw_bytes)}")
     print(f"  stored         {_human(run.stored_bytes)}")
