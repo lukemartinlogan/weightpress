@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# local test data and outputs
+models/
+out/
+results/
+*.wp
+*.kmeans/
