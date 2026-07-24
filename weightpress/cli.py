@@ -161,8 +161,8 @@ def cmd_decompress(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     """Re-read the source and the container side by side and check the bound."""
-    from .container import ContainerReader
     from .codec import unpack_chunk
+    from .container import ContainerReader
     from .reader import WeightStream
 
     with ContainerReader(args.container) as reader:
@@ -175,17 +175,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
         worst = 0.0
         n_seen = 0
         n_over = 0
-        for i, (index, original) in enumerate(stream.windows(vpw)):
+        n_windows = 0
+        for i, (_index, original) in enumerate(stream.windows(vpw)):
             if i >= len(reader.chunks):
                 break
             got = unpack_chunk(reader.read_chunk(i), eb)
             m = min(got.size, original.size)
             err = np.abs(got[:m].astype(np.float64) - original[:m].astype(np.float64))
             worst = max(worst, float(err.max()) if m else 0.0)
-            n_over += int((err > eb * (1 + 1e-6)).sum())
+            # Strict: the bound is a hard contract, so no tolerance is allowed.
+            n_over += int((err > eb).sum())
             n_seen += m
+            n_windows += 1
 
-    print(f"  checked        {n_seen} values across {i+1} windows")
+    print(f"  checked        {n_seen} values across {n_windows} windows")
     print(f"  bound          {eb:.3e}")
     print(f"  max error      {worst:.6e}")
     print(f"  violations     {n_over}")

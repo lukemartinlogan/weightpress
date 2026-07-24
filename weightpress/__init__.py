@@ -10,4 +10,4 @@ from .config import Config
 from .stats import ChunkStats, RunStats
 
 __version__ = "0.1.0"
-__all__ = ["Config", "ChunkStats", "RunStats", "__version__"]
+__all__ = ["ChunkStats", "Config", "RunStats", "__version__"]

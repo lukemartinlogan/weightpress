@@ -16,7 +16,8 @@ import dataclasses
 import json
 import os
 import struct
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import numpy as np
 

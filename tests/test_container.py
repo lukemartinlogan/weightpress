@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 from weightpress.codec import pack_chunk, quantize, unpack_chunk
-from weightpress.container import ContainerReader, ContainerWriter, write_codebook_sidecar
+from weightpress.container import (
+    ContainerReader,
+    ContainerWriter,
+    write_codebook_sidecar,
+)
 from weightpress.reader import WeightStream, restore_tensors
 
 

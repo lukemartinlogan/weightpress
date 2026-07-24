@@ -20,11 +20,11 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from weightpress.codec import unpack_chunk  # noqa: E402
-from weightpress.config import Config  # noqa: E402
-from weightpress.container import ContainerReader  # noqa: E402
-from weightpress.pipeline import compress  # noqa: E402
-from weightpress.reader import WeightStream  # noqa: E402
+from weightpress.codec import unpack_chunk
+from weightpress.config import Config
+from weightpress.container import ContainerReader
+from weightpress.pipeline import compress
+from weightpress.reader import WeightStream
 
 MB = 1 << 20
 
@@ -92,7 +92,7 @@ def run(name: str, source: str, out_dir: str, *, limit_bytes=None, **kw) -> dict
     with open(os.path.join(out_dir, f"{name}.json"), "w") as fh:
         json.dump({"summary": row, "full": stats.to_dict()}, fh, indent=2)
     print(
-        f"  {name:34s} k={str(row['chosen_k']):14s} "
+        f"  {name:34s} k={row['chosen_k']!s:14s} "
         f"{row['bits_per_value']:6.2f} b/val  {row['ratio_vs_source']:5.2f}x  "
         f"maxerr={worst:.3e}  viol={bad}  {wall:6.1f}s",
         flush=True,

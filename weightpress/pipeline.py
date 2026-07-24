@@ -17,8 +17,8 @@ import contextlib
 import os
 import threading
 import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable, Iterator
 
 import numpy as np
 
@@ -249,6 +249,12 @@ def compress(
     stream = WeightStream.open(source, dtype=dtype, limit_bytes=limit_bytes)
     values_per_window = cfg.window_size // 4  # window is fp32 working bytes
 
+    if device.startswith("cuda"):
+        # Blocks the caching allocator still holds from an earlier call in this
+        # process count as "used" to mem_get_info.  Without releasing them, a
+        # second compress() in the same process reads a stale free figure and
+        # then runs right up against the device limit.
+        torch().cuda.empty_cache()
     budget = (
         cfg.max_gpu_memory
         if cfg.max_gpu_memory is not None

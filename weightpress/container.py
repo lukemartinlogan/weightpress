@@ -44,7 +44,7 @@ class ContainerWriter:
         self._fh: BinaryIO | None = None
         self._chunks: list[dict[str, Any]] = []
 
-    def __enter__(self) -> "ContainerWriter":
+    def __enter__(self) -> ContainerWriter:
         self._fh = open(self.path, "wb")
         self._fh.write(MAGIC)
         self._fh.write(struct.pack("<II", FORMAT_VERSION, 0))
@@ -103,7 +103,7 @@ class ContainerReader:
     def close(self) -> None:
         self._fh.close()
 
-    def __enter__(self) -> "ContainerReader":
+    def __enter__(self) -> ContainerReader:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

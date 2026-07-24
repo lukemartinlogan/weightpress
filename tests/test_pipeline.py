@@ -7,12 +7,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from weightpress import kmeans as km  # noqa: E402
-from weightpress.codec import unpack_chunk  # noqa: E402
-from weightpress.config import Config  # noqa: E402
-from weightpress.container import ContainerReader  # noqa: E402
-from weightpress.gpu import plan_concurrency, resolve_device  # noqa: E402
-from weightpress.pipeline import compress, compress_window, decompress  # noqa: E402
+from weightpress import kmeans as km
+from weightpress.codec import unpack_chunk
+from weightpress.config import Config
+from weightpress.gpu import plan_concurrency, resolve_device
+from weightpress.pipeline import compress, compress_window, decompress
 
 DEVICE = resolve_device("cuda")
 DEVICES = ["cpu"] + (["cuda"] if DEVICE == "cuda" else [])

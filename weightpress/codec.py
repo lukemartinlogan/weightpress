@@ -28,15 +28,15 @@ from .config import CODE_MAX
 
 __all__ = [
     "EncodedChunk",
-    "quant_step",
-    "quantize",
     "dequantize",
-    "reconstruct",
-    "zigzag_encode",
-    "zigzag_decode",
     "labels_dtype",
     "pack_chunk",
+    "quant_step",
+    "quantize",
+    "reconstruct",
     "unpack_chunk",
+    "zigzag_decode",
+    "zigzag_encode",
 ]
 
 #: The grid is made 0.01% finer than the nominal ``2 * error_bound`` so that the

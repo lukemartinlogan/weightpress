@@ -34,7 +34,7 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def device_name(device: str) -> str:
     if device.startswith("cuda"):
         return torch().cuda.get_device_name(device)
