@@ -42,6 +42,7 @@ from .codec import (
 from .config import CODE_MAX, MAX_CODE_PLANES, Config
 from .container import ContainerReader, ContainerWriter, write_codebook_sidecar
 from .gpu import (
+    available_host_memory,
     default_budget,
     device_name,
     estimate_window_bytes,
@@ -244,16 +245,36 @@ def _quantize_gpu_relative(u2d, raw, sign, escaped, centroids, labels, eb, k):
     )
 
 
+#: Values per tile in the relative finalize; bounds host peak on RAM-limited
+#: boxes.  The persistent arrays (z, raw, pred, sign, bad) are unavoidable; the
+#: float64 reconstruct/compare temporaries are what tiling keeps small.
+FINALIZE_TILE = 1 << 22
+
+
 def _finalize_relative(z, pred_log, neg, escaped, raw, step, eb, n_values):
     """CPU, decoder-exact: reconstruct, escape every value still over the bound,
     then choose the code width.  Because this uses the same numpy ``exp`` the
-    decoder does, a value that passes here cannot fail on decode."""
-    sign = np.where(neg, np.float32(-1.0), np.float32(1.0))
-    code = zigzag_decode(z)
-    x_hat = reconstruct_relative(code, pred_log, step, sign)
-    absraw = np.abs(raw.astype(np.float64))
-    rel = np.abs(x_hat.astype(np.float64) - raw.astype(np.float64)) / np.maximum(absraw, 1e-300)
-    bad = escaped | (raw == 0) | ~np.isfinite(raw) | (rel > eb)
+    decoder does, a value that passes here cannot fail on decode.
+
+    The reconstruct-and-compare is tiled so the float64 temporaries never span
+    the whole window at once -- 8 concurrent full-window passes OOM an 11 GiB
+    host, and this is the binding constraint in relative mode, not GPU memory.
+    """
+    bad = escaped | (raw == 0) | ~np.isfinite(raw)
+    max_rel = 0.0
+    sum_rel = 0.0
+    for lo in range(0, n_values, FINALIZE_TILE):
+        hi = min(n_values, lo + FINALIZE_TILE)
+        sl = slice(lo, hi)
+        sign = np.where(neg[sl], np.float32(-1.0), np.float32(1.0))
+        x_hat = reconstruct_relative(zigzag_decode(z[sl]), pred_log[sl], step, sign)
+        o = raw[sl].astype(np.float64)
+        rel = np.abs(x_hat.astype(np.float64) - o) / np.maximum(np.abs(o), 1e-300)
+        over = ~bad[sl] & (rel > eb)
+        bad[sl] |= over
+        rel = np.where(bad[sl], 0.0, rel)  # escapes reconstruct exactly
+        max_rel = max(max_rel, float(rel.max()) if rel.size else 0.0)
+        sum_rel += float(rel.sum())
 
     # Escape overflow past the chosen code width, same cost trade-off as linear.
     z = np.where(bad, 0, z).astype(np.uint32)
@@ -266,10 +287,8 @@ def _finalize_relative(z, pred_log, neg, escaped, raw, step, eb, n_values):
 
     oidx = np.flatnonzero(bad).astype(np.uint32)
     oval = raw[bad].astype(np.float32)
-    rel_stored = np.where(bad, 0.0, rel)  # escapes reconstruct exactly
     planes = split_planes(z, planes_needed(int(z.max()) if z.size else 0))
-    return (planes, oidx, oval, float(rel_stored.max()),
-            float(rel_stored.mean()), step, neg)
+    return (planes, oidx, oval, max_rel, sum_rel / max(1, n_values), step, neg)
 
 
 def _plane_stats_gpu(z, n_values: int):
@@ -423,6 +442,18 @@ def compress(
         km.RESID_TILE_VALUES,
     )
     concurrency = plan_concurrency(budget, per_window, cfg.max_workers)
+    # Relative mode finalises each window on the host, holding several
+    # full-window arrays at once (~10 bytes/value: z, codes, pred, raw, sign,
+    # x_hat, rel).  On a RAM-limited box this, not GPU memory, is the binding
+    # constraint -- 8 workers x ~1.3 GiB OOM-killed a 11 GiB host.
+    if cfg.error_mode == "relative" and cfg.mode != "vq":
+        # Persistent host arrays per window: z (u32), raw (f32), pred (f32),
+        # sign+escape+bad (bool*3), plus tiled temporaries -- ~18 bytes/value.
+        host_per_window = values_per_window * 18
+        host_budget = int(available_host_memory() * 0.5)
+        concurrency = min(
+            concurrency, plan_concurrency(host_budget, host_per_window, cfg.max_workers)
+        )
 
     run = RunStats(
         source=os.path.abspath(source),

@@ -7,6 +7,7 @@ Torch is imported lazily so that the codec and container layers stay importable
 from __future__ import annotations
 
 import functools
+import os
 
 _TORCH = None
 
@@ -45,13 +46,7 @@ def free_memory(device: str) -> int:
     """Bytes currently free on ``device`` (whole system, not just this process)."""
     if not device.startswith("cuda"):
         # Fall back to something conservative so CPU runs still parallelise.
-        import os
-
-        try:
-            pages = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-            return int(pages)
-        except (ValueError, OSError, AttributeError):
-            return 4 << 30
+        return available_host_memory()
     free, _total = torch().cuda.mem_get_info(device)
     return int(free)
 
@@ -59,6 +54,14 @@ def free_memory(device: str) -> int:
 def default_budget(device: str, fraction: float = 0.8) -> int:
     """80% of whatever is left on the device, per the documented default."""
     return int(free_memory(device) * fraction)
+
+
+def available_host_memory() -> int:
+    """Bytes of free system RAM, for capping host-side concurrency."""
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (ValueError, OSError, AttributeError):
+        return 4 << 30
 
 
 def plan_concurrency(
