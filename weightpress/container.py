@@ -26,10 +26,10 @@ import numpy as np
 from .codec import EncodedChunk
 from .config import FORMAT_VERSION, MAGIC
 
+#: Fixed-order single blobs; the residual byte planes are variable in number and
+#: are written between the labels and the escape list.
 _BLOBS = (
     "labels_blob",
-    "code_lo_blob",
-    "code_hi_blob",
     "outlier_idx_blob",
     "outlier_val_blob",
 )
@@ -64,8 +64,12 @@ class ContainerWriter:
             "mode": chunk.mode,
             "labels_itemsize": chunk.labels_itemsize,
             "n_outliers": chunk.n_outliers,
+            "step": chunk.step,
             "centroid_bytes": int(cent.nbytes),
         }
+        entry["code_plane_lens"] = [len(b) for b in chunk.code_plane_blobs]
+        for blob in chunk.code_plane_blobs:
+            self._fh.write(blob)
         for name in _BLOBS:
             blob = getattr(chunk, name)
             entry[name + "_len"] = len(blob)
@@ -115,6 +119,7 @@ class ContainerReader:
         cent = np.frombuffer(
             self._fh.read(e["centroid_bytes"]), dtype=np.float32
         ).reshape(e["k"], e["tuple_size"])
+        planes = [self._fh.read(n) for n in e["code_plane_lens"]]
         blobs = {name: self._fh.read(e[name + "_len"]) for name in _BLOBS}
         return EncodedChunk(
             index=e["index"],
@@ -125,6 +130,8 @@ class ContainerReader:
             centroids=cent,
             labels_itemsize=e["labels_itemsize"],
             n_outliers=e["n_outliers"],
+            step=e["step"],
+            code_plane_blobs=planes,
             **blobs,
         )
 

@@ -7,12 +7,19 @@ import os
 from typing import Literal
 
 MAGIC = b"WPRS"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
-#: Codes are stored zigzagged in this many bytes; anything wider escapes to the
-#: raw-value list.  16 bits covers residuals up to 32767 * step.
-CODE_BITS = 16
-CODE_MAX = (1 << (CODE_BITS - 1)) - 1
+#: Residual codes are zigzagged and split into this many byte planes at most.
+#: The count is chosen per window from the residual range actually observed: a
+#: fixed 16-bit code word looks generous until the bound is tight, and then it
+#: falls off a cliff.  At eb=1e-5 it caps residuals at +/-0.65, which sends every
+#: LayerNorm weight and attention mask in gpt2 (all near 1.0) to the escape list
+#: -- 4.2M values, a third of the output.  Unused high planes are constant and
+#: cost almost nothing after zstd, so widening is close to free when unneeded.
+MAX_CODE_PLANES = 4
+
+#: Bound on |code| so that the zigzag of the widest code still fits in int32.
+CODE_MAX = (1 << 30) - 1
 
 KCriterion = Literal["size", "vq"]
 Mode = Literal["residual", "vq"]

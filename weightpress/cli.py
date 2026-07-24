@@ -180,7 +180,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         for i, (_index, original) in enumerate(stream.windows(vpw)):
             if i >= len(reader.chunks):
                 break
-            got = unpack_chunk(reader.read_chunk(i), eb)
+            got = unpack_chunk(reader.read_chunk(i))
             m = min(got.size, original.size)
             err = np.abs(got[:m].astype(np.float64) - original[:m].astype(np.float64))
             worst = max(worst, float(err.max()) if m else 0.0)

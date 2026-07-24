@@ -23,8 +23,18 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import numpy as np
 
 from . import kmeans as km
-from .codec import EncodedChunk, labels_dtype, pack_chunk, quant_step, unpack_chunk
-from .config import CODE_MAX, Config
+from .codec import (
+    PLANE_SAMPLE,
+    EncodedChunk,
+    choose_plane_width,
+    labels_dtype,
+    pack_chunk,
+    plane_limit,
+    planes_needed,
+    quant_step,
+    unpack_chunk,
+)
+from .config import CODE_MAX, MAX_CODE_PLANES, Config
 from .container import ContainerReader, ContainerWriter, write_codebook_sidecar
 from .gpu import (
     default_budget,
@@ -85,17 +95,21 @@ def _to_tuples(x: np.ndarray, tuple_size: int, device: str):
 def _quantize_gpu(x2d, centroids, labels, error_bound: float, k: int):
     """Residual quantization on the device.
 
-    Returns ``(lo_plane, hi_plane, outlier_index, outlier_values, max_err,
-    mean_abs_err)`` with the byte planes already split, so the host only sees
-    two uint8 arrays and never materialises a wide integer buffer.
+    Returns ``(byte_planes, outlier_index, outlier_values, max_err,
+    mean_abs_err, step)``.  The planes are split on the device and only the ones this
+    window actually needs are copied back, so the host never materialises a
+    wide integer buffer.
     """
     t = torch()
     n, tsize = x2d.shape
     n_values = n * tsize
-    step = quant_step(error_bound)
+    # The step depends on the window's largest magnitude, so it is computed here
+    # and stored with the chunk rather than re-derived by the decoder.
+    finite = x2d[t.isfinite(x2d)]
+    max_abs = float(finite.abs().max().item()) if finite.numel() else 0.0
+    step = quant_step(error_bound, max_abs)
 
-    lo = t.empty(n_values, dtype=t.uint8, device=x2d.device)
-    hi = t.empty(n_values, dtype=t.uint8, device=x2d.device)
+    zcodes = t.empty(n_values, dtype=t.int32, device=x2d.device)
     max_err = t.zeros((), dtype=t.float32, device=x2d.device)
     abs_sum = t.zeros((), dtype=t.float64, device=x2d.device)
     # One escape mask for the whole window: torch.nonzero forces a device sync,
@@ -120,10 +134,8 @@ def _quantize_gpu(x2d, centroids, labels, error_bound: float, k: int):
         bad |= ((pred + q_back * step) - src).abs() > error_bound
         code = t.where(bad, t.zeros_like(code), code)
 
-        z = (code << 1) ^ (code >> 31)  # zigzag; fits in 16 bits by construction
-        flat = z.reshape(-1)
-        lo[start * tsize : stop * tsize] = (flat & 0xFF).to(t.uint8)
-        hi[start * tsize : stop * tsize] = ((flat >> 8) & 0xFF).to(t.uint8)
+        # zigzag; |code| <= CODE_MAX keeps this inside int32's positive range
+        zcodes[start * tsize : stop * tsize] = ((code << 1) ^ (code >> 31)).reshape(-1)
 
         q_back = t.where(code > 0, code - 1, code).to(t.float32)
         recon = t.where(bad, src, pred + q_back * step)
@@ -131,6 +143,16 @@ def _quantize_gpu(x2d, centroids, labels, error_bound: float, k: int):
         max_err = t.maximum(max_err, err.max())
         abs_sum += err.sum(dtype=t.float64)
         escaped[start * tsize : stop * tsize] = bad.reshape(-1)
+
+    # Widening the code and escaping the overflow both pay for the same
+    # outliers; pick whichever is cheaper for this window, then escape the rest.
+    zu = zcodes.view(t.int32)
+    width = choose_plane_width(*_plane_stats_gpu(zu, n_values))
+    limit = plane_limit(width)
+    if limit is not None:
+        wide = zu >= limit
+        escaped |= wide
+        zcodes = t.where(wide, t.zeros_like(zcodes), zcodes)
 
     pos = t.nonzero(escaped, as_tuple=False).flatten()
     if pos.numel():
@@ -140,14 +162,37 @@ def _quantize_gpu(x2d, centroids, labels, error_bound: float, k: int):
         oidx = np.empty(0, dtype=np.uint32)
         oval = np.empty(0, dtype=np.float32)
 
+    # Split on the device and copy only the planes the window actually needs.
+    n_planes = planes_needed(int(zcodes.max().item()) if n_values else 0)
+    planes = [
+        ((zcodes >> (8 * i)) & 0xFF).to(t.uint8).cpu().numpy()
+        for i in range(n_planes)
+    ]
+
     return (
-        lo.cpu().numpy(),
-        hi.cpu().numpy(),
+        planes,
         oidx,
         oval,
         float(max_err.item()),
         float(abs_sum.item() / max(1, n_values)),
+        step,
     )
+
+
+def _plane_stats_gpu(z, n_values: int):
+    """Device-side equivalent of :func:`codec.plane_stats`."""
+    t = torch()
+    stride = max(1, z.numel() // PLANE_SAMPLE)
+    zs = z[::stride]
+    hists = [
+        t.bincount(((zs >> (8 * i)) & 0xFF).to(t.int64), minlength=256).cpu().numpy()
+        for i in range(MAX_CODE_PLANES)
+    ]
+    over = []
+    for w in range(1, MAX_CODE_PLANES + 1):
+        limit = plane_limit(w)
+        over.append(0 if limit is None else int((z >= limit).sum().item()))
+    return hists, over, n_values
 
 
 def _vq_error(x2d, centroids, labels, k: int) -> tuple[float, float]:
@@ -195,14 +240,14 @@ def compress_window(
             )
             max_err, mean_err, n_out = vq_max, vq_mean, 0
         else:
-            lo, hi, oidx, oval, max_err, mean_err = _quantize_gpu(
+            planes, oidx, oval, max_err, mean_err, step = _quantize_gpu(
                 x2d, res.centroids, res.labels, cfg.error_bound, k
             )
             vq_max, vq_mean = res.evaluation.vq_max_error, res.evaluation.vq_mean_abs_error
             chunk = pack_chunk(
                 index, centroids_np, labels_np, None, oidx, oval,
                 n_values=n_values, tuple_size=cfg.tuple_size,
-                mode=cfg.mode, level=cfg.zstd_level, planes=(lo, hi),
+                mode=cfg.mode, step=step, level=cfg.zstd_level, planes=planes,
             )
             n_out = int(oidx.size)
 
@@ -322,7 +367,7 @@ def decompress(path: str, *, out: str | None = None) -> tuple[np.ndarray, dict]:
         eb = reader.header["error_bound"]
         parts = []
         for i in range(len(reader.chunks)):
-            parts.append(unpack_chunk(reader.read_chunk(i), eb))
+            parts.append(unpack_chunk(reader.read_chunk(i)))
         values = np.concatenate(parts) if parts else np.empty(0, np.float32)
         header = reader.header
     if out:
@@ -335,4 +380,4 @@ def iter_decompressed(path: str) -> Iterator[np.ndarray]:
     with ContainerReader(path) as reader:
         eb = reader.header["error_bound"]
         for i in range(len(reader.chunks)):
-            yield unpack_chunk(reader.read_chunk(i), eb)
+            yield unpack_chunk(reader.read_chunk(i))

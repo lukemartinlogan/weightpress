@@ -30,7 +30,7 @@ def test_window_roundtrip_holds_the_bound(device):
     cfg = Config(error_bound=1e-4, window_size=1 << 20, max_k=256, device=device)
     x = _weights(1 << 18)
     chunk, stats = compress_window(0, x, cfg, device)
-    back = unpack_chunk(chunk, cfg.error_bound)
+    back = unpack_chunk(chunk)
     assert back.size == x.size
     assert np.abs(back - x).max() <= cfg.error_bound
     assert stats.max_error <= cfg.error_bound
@@ -42,7 +42,7 @@ def test_tuple_sizes_roundtrip(device, tuple_size):
     cfg = Config(error_bound=1e-4, max_k=128, tuple_size=tuple_size, device=device)
     x = _weights(100_003, seed=tuple_size)  # prime length exercises padding
     chunk, _ = compress_window(0, x, cfg, device)
-    back = unpack_chunk(chunk, cfg.error_bound)
+    back = unpack_chunk(chunk)
     assert back.size == x.size
     assert np.abs(back - x).max() <= cfg.error_bound
 
@@ -80,6 +80,27 @@ def test_k_search_size_criterion_stops_early(device):
     assert res.evaluation.k <= 4096
     best = min(t.est_bytes for t in res.trials)
     assert res.evaluation.est_bytes == best, "must keep the cheapest trial"
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_size_criterion_prices_k1_against_the_doubling_sequence(device):
+    """Adjacent weights are near-uncorrelated, so a label costs more than the
+    sharper prediction saves and k=1 wins.  The search must be able to see it."""
+    cfg = Config(error_bound=1e-4, k_criterion="size", max_k=256, device=device)
+    x2d = torch.from_numpy(_weights(1 << 16).reshape(-1, 2)).to(device)
+    res = km.search_k(x2d, cfg)
+    assert 1 in [t.k for t in res.trials], "k=1 must be among the candidates"
+    assert res.evaluation.k == 1
+    assert res.evaluation.label_entropy_bits == 0.0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_pinning_k_start_to_max_k_disables_the_k1_probe(device):
+    cfg = Config(k_start=64, max_k=64, k_criterion="size", device=device)
+    x2d = torch.from_numpy(_weights(1 << 16).reshape(-1, 2)).to(device)
+    res = km.search_k(x2d, cfg)
+    assert [t.k for t in res.trials] == [64], "a pinned k must be used verbatim"
+    assert res.evaluation.k == 64
 
 
 @pytest.mark.parametrize("device", DEVICES)

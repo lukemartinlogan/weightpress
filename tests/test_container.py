@@ -20,9 +20,9 @@ def _make_chunk(index, n_values=1000, k=64, tuple_size=2, eb=1e-4, seed=0):
     x = rng.normal(0, 0.02, size=n_tuples * tuple_size).astype(np.float32)
     centroids = rng.normal(0, 0.02, size=(k, tuple_size)).astype(np.float32)
     labels = rng.integers(0, k, size=n_tuples).astype(np.int64)
-    z, oidx, ovals = quantize(x, centroids[labels].reshape(-1), eb)
+    z, oidx, ovals, step = quantize(x, centroids[labels].reshape(-1), eb)
     chunk = pack_chunk(index, centroids, labels, z, oidx, ovals,
-                       n_values=n_values, tuple_size=tuple_size, mode="residual")
+                       n_values=n_values, tuple_size=tuple_size, mode="residual", step=step)
     return chunk, x[:n_values]
 
 
@@ -39,7 +39,7 @@ def test_container_roundtrip(tmp_path):
         assert r.header["error_bound"] == 1e-4
         assert len(r.chunks) == 5
         for i, x in enumerate(originals):
-            back = unpack_chunk(r.read_chunk(i), 1e-4)
+            back = unpack_chunk(r.read_chunk(i))
             assert np.abs(back - x).max() <= 1e-4
 
 

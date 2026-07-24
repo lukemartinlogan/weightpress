@@ -39,7 +39,7 @@ def verify(container: str, source: str) -> tuple[float, int, int]:
         for i, (_idx, original) in enumerate(stream.windows(vpw)):
             if i >= len(r.chunks):
                 break
-            got = unpack_chunk(r.read_chunk(i), eb)
+            got = unpack_chunk(r.read_chunk(i))
             m = min(got.size, original.size)
             err = np.abs(got[:m].astype(np.float64) - original[:m].astype(np.float64))
             worst = max(worst, float(err.max()) if m else 0.0)
@@ -139,10 +139,16 @@ def main() -> int:
                             limit_bytes=L, **kw))
 
     if "tuple" in groups:
-        print("\n[tuple] label cost is log2(k)/T bits per value -- how far does T help?")
-        for tsize in (1, 2, 4, 8, 16):
-            rows.append(run(f"tuple-{tsize}", models["gpt2"], args.out,
+        print("\n[tuple] a label costs log2(k)/T bits per value, so wider tuples")
+        print("        amortise it -- at what T does a codebook start to pay?")
+        for tsize in (1, 2, 4, 8, 16, 32, 64):
+            rows.append(run(f"tuple-{tsize:03d}", models["gpt2"], args.out,
                             limit_bytes=L, tuple_size=tsize, max_k=1 << 14))
+        print("        and with the codebook forced on, to price it directly:")
+        for tsize in (2, 16, 64):
+            rows.append(run(f"forcedk-t{tsize:03d}", models["gpt2"], args.out,
+                            limit_bytes=L, tuple_size=tsize,
+                            k_start=256, max_k=256))
 
     if "vq" in groups:
         print("\n[vq] the literal rule: double k until pure VQ meets the bound")

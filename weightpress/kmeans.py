@@ -236,7 +236,9 @@ def search_k(x, cfg: Config, *, generator=None) -> KMeansResult:
             best_centroids, best_labels, best_eval = centroids, labels, ev
         return ev
 
-    if cfg.k_criterion == "size" and k > 1:
+    # Pinning k_start == max_k means "use exactly this k"; don't second-guess it.
+    pinned = cfg.k_start == cfg.max_k
+    if cfg.k_criterion == "size" and k > 1 and not pinned:
         consider(1)
 
     stale = 0
