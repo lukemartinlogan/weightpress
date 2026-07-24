@@ -81,6 +81,7 @@ def run(name: str, source: str, out_dir: str, *, limit_bytes=None, **kw) -> dict
         "label_bytes": sum(c.label_bytes for c in stats.chunks),
         "code_bytes": sum(c.code_bytes for c in stats.chunks),
         "codebook_bytes": sum(c.codebook_bytes for c in stats.chunks),
+        "outlier_bytes": sum(c.outlier_bytes for c in stats.chunks),
         "seconds": wall,
         "trials": stats.chunks[0].k_trials if stats.chunks else [],
     }
@@ -159,7 +160,7 @@ def main() -> int:
 
     if "bound" in groups:
         print("\n[bound] error bound sweep")
-        for eb in (1e-3, 1e-4, 1e-5):
+        for eb in (1e-3, 1e-4, 1e-5, 1e-6):
             rows.append(run(f"bound-{eb:.0e}", models["gpt2"], args.out,
                             limit_bytes=L, error_bound=eb))
 

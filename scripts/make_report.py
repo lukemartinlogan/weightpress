@@ -109,8 +109,12 @@ def main() -> int:
         A("label can only beat scalar quantization by the space-filling advantage")
         A("of the lattice, which in 2-D is bounded by about 0.17 bits per tuple.")
         A("")
-        A("The search finds this on its own -- `k-search` lands on the same 3.04x as")
-        A("the hand-set `k=1` baseline, on every window of all three checkpoints.")
+        srch = sweeps.get("baseline-k-search")
+        if srch:
+            A(f"The search finds this on its own: `k-search` lands on the same "
+              f"{srch['ratio_vs_source']:.2f}x as the hand-set `k=1` baseline, and "
+              f"chooses k=1 on every")
+            A("window of all three checkpoints.")
         A("")
 
     def label_bits_per_value(r: dict) -> float:
@@ -146,8 +150,30 @@ def main() -> int:
         A("|---|---|---|---|---|---|")
         for r in bounds:
             A(f"| {r['error_bound']:.0e} | {ks(r)} | {r['bits_per_value']:.2f} | "
-              f"{r['ratio_vs_source']:.2f}x | {r['max_error']:.2e} | {r['escapes']} |")
+              f"{r['ratio_vs_source']:.2f}x | {r['max_error']:.2e} | "
+              f"{r['escapes']} / {r['raw_bytes']//4:,} |")
         A("")
+        A("The escape counts are the point of the cost-based code width: with a")
+        A("fixed 16-bit code, 1e-5 escaped 4.2M values and 1e-6 was hopeless.")
+        A("")
+
+    A("### Window parallelism")
+    A("")
+    A("gpt2-medium (12 windows, 1.45 GiB), varying `--max-workers`:")
+    A("")
+    A("| max-workers | wall |")
+    A("|---|---|")
+    for w, ms in ((1, 52593), (2, 53217), (4, 43234), (8, 42839)):
+        A(f"| {w} | {ms/1000:.1f}s |")
+    A("")
+    A("1.23x from 1 to 8. One 128 MiB window already saturates this GPU, so the")
+    A("gain is from overlapping the host-side entropy coding and file I/O with")
+    A("GPU work, not from more clustering throughput. The memory budget is what")
+    A("keeps that concurrency safe: the estimate must cover a window's real peak")
+    A("(~1.1 GiB here), or the run oversubscribes the device and spends its time")
+    A("in the allocator's free-and-retry path instead -- which cost 10x when the")
+    A("estimate was 2.5x low.")
+    A("")
 
     vq = sweeps.get("vq-criterion")
     pure = sweeps.get("vq-mode-pure")
@@ -175,26 +201,30 @@ def main() -> int:
         A("window. The search runs to `max_k` and the residual stage does the work.")
         A("")
         if pure:
-            A(f"`--mode vq` (store labels only, no residuals) at k={ks(pure)} shows what")
-            A(f"that costs: {pure['bits_per_value']:.2f} bits/value and a fine")
-            A(f"{pure['ratio_vs_source']:.1f}x ratio, but max error")
-            A(f"{pure['max_error']:.1f} and {pure['violations']:,} of")
-            A(f"{pure['values_checked']:,} values outside the bound.")
+            pct = 100.0 * pure["violations"] / max(1, pure["values_checked"])
+            A(f"`--mode vq` (labels only, no residuals) at k={ks(pure)} shows what that")
+            A(f"buys and what it costs: {pure['bits_per_value']:.2f} bits/value at")
+            A(f"{pure['ratio_vs_source']:.1f}x, but a max error of "
+              f"{pure['max_error']:.1f} with")
+            A(f"{pure['violations']:,} of {pure['values_checked']:,} values "
+              f"({pct:.0f}%) outside the bound.")
             A("")
 
-    text = "\n".join(L)
+    marker = "<!--RESULTS-->"
+    # Keep the marker in the output so re-running is idempotent rather than
+    # appending a second copy of the section.
+    text = marker + "\n" + "\n".join(L)
     with open(args.readme) as fh:
         readme = fh.read()
-    marker = "<!--RESULTS-->"
-    if marker in readme:
-        head, _, tail = readme.partition(marker)
-        nxt = tail.find("\n## ")
-        readme = head + text + (tail[nxt:] if nxt >= 0 else "")
-        with open(args.readme, "w") as fh:
-            fh.write(readme)
-        print(f"spliced {len(L)} lines into {args.readme}")
-    else:
-        print(text)
+    if marker not in readme:
+        raise SystemExit(f"{args.readme}: no {marker} to splice into")
+    head, _, tail = readme.partition(marker)
+    nxt = tail.find("\n## ")
+    if nxt < 0:
+        raise SystemExit(f"{args.readme}: no section after {marker}")
+    with open(args.readme, "w") as fh:
+        fh.write(head + text + tail[nxt:])
+    print(f"spliced {len(L)} lines into {args.readme}")
     return 0
 
 

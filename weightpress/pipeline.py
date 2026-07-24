@@ -364,7 +364,6 @@ def compress(
 def decompress(path: str, *, out: str | None = None) -> tuple[np.ndarray, dict]:
     """Rebuild the full fp32 value stream from a container."""
     with ContainerReader(path) as reader:
-        eb = reader.header["error_bound"]
         parts = []
         for i in range(len(reader.chunks)):
             parts.append(unpack_chunk(reader.read_chunk(i)))
@@ -378,6 +377,5 @@ def decompress(path: str, *, out: str | None = None) -> tuple[np.ndarray, dict]:
 def iter_decompressed(path: str) -> Iterator[np.ndarray]:
     """Stream windows back one at a time (for verification without holding all)."""
     with ContainerReader(path) as reader:
-        eb = reader.header["error_bound"]
         for i in range(len(reader.chunks)):
             yield unpack_chunk(reader.read_chunk(i))
