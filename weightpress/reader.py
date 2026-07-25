@@ -23,6 +23,10 @@ import numpy as np
 
 #: safetensors dtype tag -> (numpy view dtype, bytes per element).  BF16 has no
 #: numpy equivalent, so it is read as uint16 and widened by hand.
+#: Bytes of source data read (and widened to fp32) at a time; bounds the reader's
+#: host footprint so a huge tensor cannot materialise whole.
+_READ_CHUNK_BYTES = 64 << 20
+
 _ST_DTYPES: dict[str, tuple[np.dtype, int]] = {
     "F64": (np.dtype("<f8"), 8),
     "F32": (np.dtype("<f4"), 4),
@@ -176,11 +180,17 @@ class _SafeTensorsStream(WeightStream):
     def _iter_tensors(self) -> Iterator[np.ndarray]:
         mm = np.memmap(self.path, dtype=np.uint8, mode="r")
         for (start, end, tag) in self._byte_ranges:
-            dt, _ = _ST_DTYPES[tag]
-            # Copy the byte range before viewing: a tensor may begin at an
-            # offset that is not aligned for its element type.
-            raw = np.frombuffer(bytes(mm[start:end]), dtype=dt)
-            yield _widen(raw, tag)
+            dt, itemsize = _ST_DTYPES[tag]
+            # Yield large tensors in slices so a single embedding table (which
+            # can be ~9 GB once widened to fp32) never materialises whole and
+            # OOMs the host.  Slices are byte-aligned to the element size.
+            step = max(itemsize, (_READ_CHUNK_BYTES // itemsize) * itemsize)
+            for lo in range(start, end, step):
+                hi = min(end, lo + step)
+                # Copy before viewing: a tensor may begin at an offset that is
+                # not aligned for its element type.
+                raw = np.frombuffer(bytes(mm[lo:hi]), dtype=dt)
+                yield _widen(raw, tag)
 
 
 class _NpyStream(WeightStream):

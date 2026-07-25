@@ -121,6 +121,7 @@ def main() -> int:
     os.makedirs(args.out, exist_ok=True)
     md = args.models_dir
     models = {
+        "gemma-4-E2B": os.path.join(md, "gemma-4-E2B", "model.safetensors"),
         "gpt2": os.path.join(md, "gpt2.safetensors"),
         "gpt2-medium": os.path.join(md, "gpt2-medium.safetensors"),
         "tinyllama": os.path.join(md, "tinyllama.safetensors"),

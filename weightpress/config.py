@@ -48,7 +48,12 @@ class Config:
     error_mode: ErrorMode = "relative"
     window_size: int = 128 << 20
     tuple_size: int = 2
-    max_gpu_memory: int | None = None  # None -> 80% of free at startup
+    #: Explicit GPU byte budget; None -> ``gpu_budget_fraction`` of free memory.
+    max_gpu_memory: int | None = None
+    #: Fraction of free GPU memory to claim when ``max_gpu_memory`` is unset.
+    #: The issue suggested 80%; kept conservative at 50% so weightpress leaves
+    #: room for other GPU work and does not oversubscribe the device.
+    gpu_budget_fraction: float = 0.5
     output_dir: str = "."
 
     # --- k search -------------------------------------------------------

@@ -56,6 +56,11 @@ from .stats import ChunkStats, RunStats
 
 _local = threading.local()
 
+#: Values per GPU tile in cluster mode.  Cluster mode only needs log|x| and a
+#: floor, so a small tile keeps the device footprint to a few tens of MB per
+#: window instead of holding the whole window (and an int64 label array) at once.
+CLUSTER_TILE = 1 << 22
+
 
 def _stream_ctx(device: str):
     """A per-thread CUDA stream so concurrent windows really do overlap."""
@@ -338,18 +343,31 @@ def _cluster_window(
     """
     t = torch()
     t0 = time.time()
-    n_values = int(values.size)
+    values_np = np.ascontiguousarray(values, dtype=np.float32)
+    n_values = values_np.size
     eb = cfg.error_bound
     cell_w = 2.0 * math.log1p(eb)
 
+    # Sign and escape masks are cheap on the host; keeping them off the GPU
+    # avoids two full-window device arrays.
+    absv = np.abs(values_np)
+    sign_np = values_np < 0
+    esc_np = (values_np == 0) | ~np.isfinite(values_np)
+
+    # The GPU only computes log|x| and the cell index, and it does so a tile at
+    # a time so its footprint is a few tens of MB rather than the whole window.
+    tile = CLUSTER_TILE
     with _stream_ctx(device):
-        raw = t.from_numpy(np.ascontiguousarray(values, np.float32).copy()).to(device)
-        absx = raw.abs()
-        escaped = (raw == 0) | ~t.isfinite(raw)
-        good = absx[~escaped]
-        u = t.log(t.where(escaped, t.ones_like(absx), absx))
-        umin = float(good.log().min().item()) if good.numel() else 0.0
-        umax = float(good.log().max().item()) if good.numel() else 0.0
+        umin, umax = math.inf, -math.inf
+        for lo in range(0, n_values, tile):
+            a = t.from_numpy(absv[lo : lo + tile]).to(device, non_blocking=True)
+            m = a[(a > 0) & t.isfinite(a)]
+            if m.numel():
+                lg = t.log(m)
+                umin = min(umin, float(lg.min().item()))
+                umax = max(umax, float(lg.max().item()))
+        if not math.isfinite(umin):
+            umin = umax = 0.0
 
         # Double the cell count from k_start until each cell is <= cell_w wide.
         k = 1 << max(6, (max(2, cfg.k_start) - 1).bit_length())
@@ -358,11 +376,13 @@ def _cluster_window(
             k *= 2
         cellw = span / k
 
-        cells = t.clamp(((u - umin) / cellw).floor().to(t.int64), 0, k - 1)
-        cells_np = cells.cpu().numpy()
-        sign_np = (raw < 0).cpu().numpy()
-        esc_np = escaped.cpu().numpy()
-        values_np = raw.cpu().numpy()
+        cells_np = np.empty(n_values, dtype=np.int32)
+        for lo in range(0, n_values, tile):
+            hi = min(n_values, lo + tile)
+            a = t.from_numpy(absv[lo:hi]).to(device, non_blocking=True)
+            u = t.log(t.where((a > 0) & t.isfinite(a), a, t.ones_like(a)))
+            cell = t.clamp(((u - umin) / cellw).floor().to(t.int32), 0, k - 1)
+            cells_np[lo:hi] = cell.cpu().numpy()
 
     # Occupied cells become the codebook; labels index into it.
     occupied, labels = np.unique(cells_np, return_inverse=True)
@@ -515,7 +535,7 @@ def compress(
     budget = (
         cfg.max_gpu_memory
         if cfg.max_gpu_memory is not None
-        else default_budget(device)
+        else default_budget(device, cfg.gpu_budget_fraction)
     )
     per_window = estimate_window_bytes(
         values_per_window, cfg.tuple_size, km.DIST_BUFFER_BYTES,
