@@ -50,6 +50,8 @@ entropy-coded residual; smaller, but then k is the predictor size), `--mode vq`
   stream, 153 windows, stored 7.26 GiB, **2.63x vs fp32 / ~1.31x vs bf16
   source**, 888 s (~15 min) on the contended RTX 5080. Report:
   `/home/iowarp/wp-gemma/gemma.json` (NOT in the repo — see below).
+  **Independent `verify` PASSED**: all 5,123,178,979 values re-read from source,
+  max %err 9.997e-05, 0 violations.
 - Bound sweep on gpt2: k doubles per decade — 2^11 (1e-2) → 2^14 → 2^17 →
   2^21 → 2^24 (1e-6); ratio 3.16x → 0.89x. All 0 violations.
 - Lossless zstd baseline on the same bytes: 1.17–1.33x (vs our ~1.8x fp32).
@@ -113,10 +115,6 @@ Handy flags: `--limit-bytes 256MB` (quick runs), `-e 1e-5` (tighter bound),
 
 ## Caveats / gotchas to carry over
 
-- **gemma independent `verify` was not run to completion here** (interrupted; the
-  ~15 min re-read was pending). The compressor's own decoder-exact check reported
-  the bound HELD, but re-run `weightpress verify out/model.wp` on the new box to
-  confirm end-to-end.
 - **Host RAM, not GPU, was the binding constraint.** Cluster/residual modes
   finalize each window on the CPU; concurrency is capped by `available_host_memory
   × 0.5 / (~24 bytes·values_per_window)`. On 11 GiB this allowed ~4 windows. More
@@ -134,8 +132,8 @@ Handy flags: `--limit-bytes 256MB` (quick runs), `-e 1e-5` (tighter bound),
 
 ## Open questions / next steps for the study
 
-1. **Run gemma-4-E2B end-to-end verify** on the new box; add its row to the
-   README results (the `experiments.py` models dict already includes it).
+1. **Add gemma-4-E2B to the README results** (verified: ~1.31x vs source, 0
+   violations; the `experiments.py` models dict already includes it).
 2. **Is bf16 worth widening to fp32 at all?** For a relative bound, quantizing
    bf16 in its native precision (8-bit mantissa) may need far fewer clusters.
    Consider a bf16-native path / measuring vs-source honestly everywhere.
